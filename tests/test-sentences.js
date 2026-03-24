@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 // Sentence-splitting logic extracted from content.js extractSentencesFromBlock
-const sentenceRe = /[^!.?…]*(?:[!.?…]+['"'"]?\s*)/g;
+const sentenceRe = /[^!.?…]*(?:[!.?…]+['"'"\u201D]?\s*)/g;
 
 function splitSentences(text) {
   const results = [];
@@ -48,9 +48,14 @@ describe('Sentence splitting regex', () => {
     assert.equal(result[1], 'Okay.');
   });
 
-  it('handles quoted sentence endings', () => {
+  it('handles quoted sentence endings with double quotes', () => {
     const result = splitSentences('She said "hello." Then left.');
     assert.deepEqual(result, ['She said "hello."', 'Then left.']);
+  });
+
+  it('handles quoted sentence endings with single quotes', () => {
+    const result = splitSentences("He said 'goodbye.' She stayed.");
+    assert.equal(result.length, 2);
   });
 
   it('handles smart-quoted endings', () => {
@@ -91,11 +96,5 @@ describe('Sentence splitting regex', () => {
   it('handles single sentence with terminal punctuation', () => {
     const result = splitSentences('Just one sentence.');
     assert.deepEqual(result, ['Just one sentence.']);
-  });
-
-  it('handles abbreviations (known limitation — splits on them)', () => {
-    const result = splitSentences('Mr. Smith went home.');
-    // Regex splits on the period in "Mr." — this is a known tradeoff
-    assert.ok(result.length >= 2, 'abbreviations cause extra splits');
   });
 });

@@ -1,6 +1,13 @@
 (() => {
   'use strict';
 
+  // ── Constants ──────────────────────────────────────────────────────
+  const DEFAULT_VOICE_ID = '21m00Tcm4TlvDq8ikWAM'; // FIX 8: single constant
+  const CURSOR_SIZE      = 32;
+  const LINE_TOLERANCE   = 14;  // for END line detection (confirmed working)
+  const SPEEDS           = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+  const TTS_TIMEOUT_MS   = 35000; // FIX 7: response timeout
+
   // ── State ──────────────────────────────────────────────────────────
   let highlightMode = false;
   let isPainting    = false;
@@ -21,7 +28,7 @@
   let pbAudio       = null;   // current Audio element
   let pbState       = 'idle'; // 'idle' | 'loading' | 'playing' | 'paused' | 'error'
   let pbRequestId   = 0;      // monotonic counter to discard stale TTS responses
-  let cachedVoice   = '21m00Tcm4TlvDq8ikWAM';
+  let cachedVoice   = DEFAULT_VOICE_ID; // FIX 8: use constant
   let cachedSpeed   = 1.0;
 
   // ── Load settings and listen for changes ──────────────────────────
@@ -34,9 +41,9 @@
     }
   );
   chrome.storage.onChanged.addListener((changes) => {
-    if (changes.articleMode)  articleModeEnabled = changes.articleMode.newValue;
-    if (changes.defaultVoice) cachedVoice = changes.defaultVoice.newValue;
-    if (changes.defaultSpeed) cachedSpeed = parseFloat(changes.defaultSpeed.newValue) || 1.0;
+    if (changes.articleMode)   articleModeEnabled = changes.articleMode.newValue;
+    if (changes.defaultVoice)  cachedVoice = changes.defaultVoice.newValue;
+    if (changes.defaultSpeed)  cachedSpeed = parseFloat(changes.defaultSpeed.newValue) || 1.0;
   });
 
   // ── DOM elements (lazily created) ──────────────────────────────────
@@ -48,10 +55,6 @@
   let menuPanelEl   = null;
   let toastEl       = null;
   let toastTimer    = 0;
-
-  const CURSOR_SIZE    = 32;
-  const LINE_TOLERANCE = 14;  // for END line detection (confirmed working)
-  const SPEEDS         = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 
   // ── Initialization ─────────────────────────────────────────────────
   function ensureElements() {
@@ -736,10 +739,14 @@
   }
 
   function playSentence(idx) {
-    // Stop any current audio
+    // FIX 2: Cancel any active speechSynthesis before starting a new sentence
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+
+    // FIX 3: Stop any current audio and properly release resources
     if (pbAudio) {
       pbAudio.pause();
       pbAudio.removeAttribute('src');
+      pbAudio.load(); // releases the network/decode resource
       pbAudio = null;
     }
 
@@ -764,10 +771,22 @@
     const speed = speedSlider
       ? (SPEEDS[parseInt(speedSlider.value)] || cachedSpeed)
       : cachedSpeed;
+    const text = pbSentences[idx].text;
+
+    // FIX 7: Set a timeout so we don't hang in 'loading' forever if the
+    // background worker dies or the network request stalls.
+    const responseTimeout = setTimeout(() => {
+      if (requestId !== pbRequestId) return;
+      showPlayerWarning('Request timed out');
+      fallbackSpeechSynthesis(text, speed, requestId);
+    }, TTS_TIMEOUT_MS);
 
     chrome.runtime.sendMessage(
-      { type: 'tts-request', text: pbSentences[idx].text, voice, speed },
+      { type: 'tts-request', text, voice, speed },
       (response) => {
+        // FIX 7: Clear the timeout — we got a response
+        clearTimeout(responseTimeout);
+
         // Discard stale responses (user skipped or cancelled)
         if (requestId !== pbRequestId) return;
 
@@ -781,11 +800,17 @@
             : getErrorMessage(response);
           console.warn('[Highlighter TTS]', errMsg, '— falling back to speechSynthesis');
           showPlayerWarning(errMsg);
-          fallbackSpeechSynthesis(pbSentences[idx].text, speed, requestId);
+          fallbackSpeechSynthesis(text, speed, requestId);
           return;
         }
 
-        playAudioDataUrl(response.audioDataUrl, requestId, speed);
+        // FIX 4: Validate audioDataUrl before attempting playback
+        if (!response.audioDataUrl) {
+          showPlayerError('Empty audio response');
+          return;
+        }
+
+        playAudioDataUrl(response.audioDataUrl, requestId, speed, text);
       }
     );
   }
@@ -809,23 +834,38 @@
     }
   }
 
-  function playAudioDataUrl(dataUrl, requestId, speed) {
+  function playAudioDataUrl(dataUrl, requestId, speed, text) {
+    // FIX 1: Capture requestId in closure so the ended handler can check staleness
+    const capturedId = requestId;
     const playbackRate = normalizePlaybackRate(speed);
     pbAudio = new Audio(dataUrl);
     pbAudio.playbackRate = playbackRate;
-    pbAudio.addEventListener('ended', onAudioEnded);
-    pbAudio.addEventListener('error', () => {
-      if (requestId !== pbRequestId) return;
-      showPlayerError('Audio decode error');
+
+    // FIX 1: Stale-request guard on ended event prevents double-advance on skip
+    pbAudio.addEventListener('ended', () => {
+      if (capturedId !== pbRequestId) return;
+      onAudioEnded();
     });
+
+    // FIX 5: Fall back to speechSynthesis on Audio error (CSP pages)
+    // On strict-CSP pages, data: URI audio fails. Instead of just showing
+    // an error, fall back to the browser's built-in speech synthesis.
+    pbAudio.addEventListener('error', () => {
+      if (capturedId !== pbRequestId) return;
+      console.warn('[Highlighter TTS] Audio element error — falling back to speechSynthesis');
+      fallbackSpeechSynthesis(text, speed, capturedId);
+    });
+
     pbAudio.play()
       .then(() => {
-        if (requestId !== pbRequestId) return;
+        if (capturedId !== pbRequestId) return;
         setPlaybackState('playing');
       })
       .catch((err) => {
-        if (requestId !== pbRequestId) return;
-        showPlayerError('Playback blocked: ' + err.message);
+        if (capturedId !== pbRequestId) return;
+        // FIX 5: Also fall back on play() promise rejection (another CSP vector)
+        console.warn('[Highlighter TTS] Audio play() rejected — falling back to speechSynthesis:', err.message);
+        fallbackSpeechSynthesis(text, speed, capturedId);
       });
   }
 
@@ -856,11 +896,14 @@
 
   function stopPlayback() {
     pbRequestId++; // invalidate in-flight requests
+    // FIX 3: Properly release audio resources
     if (pbAudio) {
       pbAudio.pause();
       pbAudio.removeAttribute('src');
+      pbAudio.load(); // releases the network/decode resource
       pbAudio = null;
     }
+    // FIX 2: Also cancel speechSynthesis when stopping
     if (window.speechSynthesis) window.speechSynthesis.cancel();
     setPlaybackState('idle');
   }
@@ -884,6 +927,10 @@
         : 'Invalid API key';
       case 'billing-required':  return 'API error (402)\nCheck ElevenLabs billing/quota';
       case 'rate-limited':      return 'Rate limited — try again shortly';
+      case 'text-too-long':     return response.detail
+        ? `Text too long\n${truncateDetail(response.detail)}`
+        : 'Selected text is too long for one request';
+      case 'timeout':           return 'Request timed out — try a shorter selection';
       case 'api-error':         return response.detail
         ? `API error (${response.status})\n${truncateDetail(response.detail)}`
         : `API error (${response.status})`;
@@ -909,7 +956,7 @@
     const option = document.createElement('option');
     option.value = voiceId;
     option.textContent = label || voiceId;
-    selectEl.replaceChildren(option);
+    selectEl.appendChild(option);
     selectEl.value = voiceId;
   }
 
@@ -1033,6 +1080,9 @@
     e.preventDefault();
     e.stopPropagation();
     isPainting = false;
+
+    // FIX 6: Guard against empty strokePoints before accessing indices
+    if (!strokePoints.length) return;
 
     const startPt = strokePoints[0];
     const endPt   = strokePoints[strokePoints.length - 1];

@@ -13,7 +13,13 @@ chrome.storage.local.get(
   ['elApiKey', 'modelId', 'defaultVoice', 'defaultSpeed', 'articleMode'],
   (data) => {
     if (data.elApiKey) tokenInput.value = data.elApiKey;
-    if (data.modelId) modelSelect.value = data.modelId;
+    if (data.modelId) {
+      modelSelect.value = data.modelId;
+      if (!modelSelect.value) {
+        // Stale model — clear storage so default is used
+        chrome.storage.local.remove('modelId');
+      }
+    }
     ensureVoiceOption(data.defaultVoice || DEFAULT_VOICE_ID, 'Configured voice');
     if (data.defaultSpeed) speedSelect.value = data.defaultSpeed;
     if (data.articleMode !== undefined) articleToggle.checked = data.articleMode;
@@ -46,7 +52,7 @@ function ensureVoiceOption(voiceId, label) {
   const option = document.createElement('option');
   option.value = voiceId;
   option.textContent = label || voiceId;
-  voiceSelect.replaceChildren(option);
+  voiceSelect.appendChild(option);
   voiceSelect.value = voiceId;
 }
 

@@ -1,7 +1,7 @@
 /**
- * Tests for Phase 4 TTS integration logic.
+ * Tests for TTS integration logic.
  * Covers: error message mapping, playback state transitions,
- * stale request guard, and base64 encoding.
+ * stale request guard, playback-rate normalization, and base64 encoding.
  */
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
@@ -13,11 +13,13 @@ function getErrorMessage(response) {
   switch (response.error) {
     case 'no-token':          return 'Set ElevenLabs API key in extension settings';
     case 'empty-text':        return 'Select some text before playing';
+    case 'text-too-long':     return response.detail || 'Text exceeds maximum length';
     case 'auth-failed':       return response.detail
       ? `Authentication failed\n${truncateDetail(response.detail)}`
       : 'Invalid API key';
     case 'billing-required':  return 'API error (402)\nCheck ElevenLabs billing/quota';
     case 'rate-limited':      return 'Rate limited — try again shortly';
+    case 'timeout':           return 'Request timed out — try again';
     case 'api-error':         return response.detail
       ? `API error (${response.status})\n${truncateDetail(response.detail)}`
       : `API error (${response.status})`;
@@ -48,7 +50,17 @@ describe('getErrorMessage', () => {
     assert.match(getErrorMessage({ error: 'empty-text' }), /select some text/i);
   });
 
-  it('maps auth-failed', () => {
+  it('maps text-too-long with detail', () => {
+    const msg = getErrorMessage({ error: 'text-too-long', detail: 'Text is 6000 characters; maximum is 5000.' });
+    assert.match(msg, /6000/);
+  });
+
+  it('maps text-too-long without detail', () => {
+    const msg = getErrorMessage({ error: 'text-too-long' });
+    assert.match(msg, /exceeds maximum/i);
+  });
+
+  it('maps auth-failed without detail', () => {
     assert.match(getErrorMessage({ error: 'auth-failed' }), /invalid/i);
   });
 
@@ -66,6 +78,10 @@ describe('getErrorMessage', () => {
 
   it('maps rate-limited', () => {
     assert.match(getErrorMessage({ error: 'rate-limited' }), /rate/i);
+  });
+
+  it('maps timeout', () => {
+    assert.match(getErrorMessage({ error: 'timeout' }), /timed out/i);
   });
 
   it('maps api-error with status code', () => {
@@ -90,6 +106,36 @@ describe('getErrorMessage', () => {
 
   it('returns "Unknown error" for empty error field', () => {
     assert.equal(getErrorMessage({ error: '' }), 'Unknown error');
+  });
+});
+
+// ── truncateDetail ───────────────────────────────────────────────────
+
+describe('truncateDetail', () => {
+  it('returns a placeholder for empty detail', () => {
+    assert.equal(truncateDetail('   '), 'Unknown upstream error');
+  });
+
+  it('returns a placeholder for non-string detail', () => {
+    assert.equal(truncateDetail(null), 'Unknown upstream error');
+    assert.equal(truncateDetail(undefined), 'Unknown upstream error');
+    assert.equal(truncateDetail(42), 'Unknown upstream error');
+  });
+
+  it('passes through short detail strings unchanged', () => {
+    assert.equal(truncateDetail('Something went wrong'), 'Something went wrong');
+  });
+
+  it('truncates long detail strings at 140 characters', () => {
+    const msg = truncateDetail('x'.repeat(200));
+    assert.equal(msg.length, 140);
+    assert.ok(msg.endsWith('...'));
+    assert.equal(msg, 'x'.repeat(137) + '...');
+  });
+
+  it('does not truncate strings exactly at 140 characters', () => {
+    const input = 'a'.repeat(140);
+    assert.equal(truncateDetail(input), input);
   });
 });
 
@@ -198,30 +244,29 @@ function normalizePlaybackRate(speed) {
 describe('normalizePlaybackRate', () => {
   it('defaults invalid input to 1.0', () => {
     assert.equal(normalizePlaybackRate('abc'), 1.0);
+    assert.equal(normalizePlaybackRate(undefined), 1.0);
+    assert.equal(normalizePlaybackRate(null), 1.0);
+    assert.equal(normalizePlaybackRate(NaN), 1.0);
+    assert.equal(normalizePlaybackRate(Infinity), 1.0);
   });
 
-  it('clamps values below minimum', () => {
+  it('clamps values below minimum to 0.5', () => {
     assert.equal(normalizePlaybackRate(0.25), 0.5);
+    assert.equal(normalizePlaybackRate(0), 0.5);
+    assert.equal(normalizePlaybackRate(-1), 0.5);
   });
 
   it('preserves in-range values', () => {
     assert.equal(normalizePlaybackRate('1.25'), 1.25);
+    assert.equal(normalizePlaybackRate(0.5), 0.5);
+    assert.equal(normalizePlaybackRate(2.0), 2.0);
+    assert.equal(normalizePlaybackRate(1), 1.0);
   });
 
-  it('clamps values above maximum', () => {
+  it('clamps values above maximum to 2.0', () => {
     assert.equal(normalizePlaybackRate(3), 2.0);
-  });
-});
-
-describe('truncateDetail', () => {
-  it('returns a placeholder for empty detail', () => {
-    assert.equal(truncateDetail('   '), 'Unknown upstream error');
-  });
-
-  it('truncates long detail strings', () => {
-    const msg = truncateDetail('x'.repeat(200));
-    assert.equal(msg.length, 140);
-    assert.ok(msg.endsWith('...'));
+    assert.equal(normalizePlaybackRate(2.1), 2.0);
+    assert.equal(normalizePlaybackRate(100), 2.0);
   });
 });
 

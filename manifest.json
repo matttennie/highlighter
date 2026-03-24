@@ -3,6 +3,7 @@
   "name": "Highlighter TTS",
   "version": "0.1.0",
   "description": "Select text with a paint-brush stroke and hear it read aloud via ElevenLabs TTS",
+  "minimum_chrome_version": "102",
   "permissions": [
     "activeTab",
     "storage",
@@ -31,6 +32,10 @@
   ],
   "commands": {
     "toggle-highlight-mode": {
+      "suggested_key": {
+        "default": "Alt+H",
+        "mac": "Alt+H"
+      },
       "description": "Toggle highlight mode"
     }
   },

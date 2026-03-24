@@ -33,11 +33,43 @@ describe('normalizeSpeed', () => {
   it('defaults invalid values to 1x', () => {
     assert.equal(normalizeSpeed(undefined), 1);
     assert.equal(normalizeSpeed('abc'), 1);
+    assert.equal(normalizeSpeed(null), 1);
+    assert.equal(normalizeSpeed(NaN), 1);
+    assert.equal(normalizeSpeed(Infinity), 1);
   });
 
   it('clamps speeds to the supported range', () => {
     assert.equal(normalizeSpeed(0.1), 0.5);
     assert.equal(normalizeSpeed(1.5), 1.5);
     assert.equal(normalizeSpeed(3), 2);
+  });
+});
+
+describe('text length validation', () => {
+  it('enforces a maximum text length of 5000 characters', () => {
+    assert.match(backgroundJs, /MAX_TEXT_LENGTH\s*=\s*5000/);
+    assert.match(backgroundJs, /normalizedText\.length > MAX_TEXT_LENGTH/);
+  });
+});
+
+describe('speed in API body', () => {
+  it('includes speed in voice_settings', () => {
+    assert.match(backgroundJs, /voice_settings/);
+    assert.match(backgroundJs, /speed:\s*normalizedSpeed/);
+  });
+});
+
+describe('error response JSON parsing', () => {
+  it('parses error responses as JSON', () => {
+    assert.match(backgroundJs, /\.json\(\)/);
+    assert.match(backgroundJs, /async function parseErrorDetail\(res\)/);
+  });
+});
+
+describe('AbortController timeout', () => {
+  it('uses AbortController for request timeouts', () => {
+    assert.match(backgroundJs, /AbortController/);
+    assert.match(backgroundJs, /controller\.abort\(\)/);
+    assert.match(backgroundJs, /signal:\s*controller\.signal/);
   });
 });

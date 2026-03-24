@@ -6,6 +6,7 @@ import { describe, it } from 'node:test';
 const rootDir = path.resolve(import.meta.dirname, '..');
 const popupHtml = fs.readFileSync(path.join(rootDir, 'popup', 'popup.html'), 'utf8');
 const popupJs = fs.readFileSync(path.join(rootDir, 'popup', 'popup.js'), 'utf8');
+const backgroundJs = fs.readFileSync(path.join(rootDir, 'background.js'), 'utf8');
 
 describe('popup.html', () => {
   it('associates labels with form controls', () => {
@@ -34,5 +35,16 @@ describe('popup.js', () => {
   it('loads voice options dynamically from the background worker', () => {
     assert.match(popupJs, /chrome\.runtime\.sendMessage\(\{ type: 'voices-request' \}/);
     assert.match(popupJs, /ensureVoiceOption\(data\.defaultVoice \|\| DEFAULT_VOICE_ID, 'Configured voice'\)/);
+  });
+});
+
+describe('default voice ID consistency', () => {
+  it('uses the same default voice ID in popup.js and background.js', () => {
+    const popupMatch = popupJs.match(/DEFAULT_VOICE_ID\s*=\s*'([^']+)'/);
+    const bgMatch = backgroundJs.match(/DEFAULT_VOICE_ID\s*=\s*'([^']+)'/);
+    assert.ok(popupMatch, 'popup.js should define DEFAULT_VOICE_ID');
+    assert.ok(bgMatch, 'background.js should define DEFAULT_VOICE_ID');
+    assert.equal(popupMatch[1], bgMatch[1], 'DEFAULT_VOICE_ID must match across files');
+    assert.equal(popupMatch[1], '21m00Tcm4TlvDq8ikWAM', 'DEFAULT_VOICE_ID should be the Rachel voice');
   });
 });
