@@ -1,0 +1,1095 @@
+(() => {
+  'use strict';
+
+  // ── State ──────────────────────────────────────────────────────────
+  let highlightMode = false;
+  let isPainting    = false;
+  let strokePoints  = [];
+
+  // Playback state: sentences resolved from the last stroke
+  let pbSentences   = [];   // [{text, range, startLineY, endLineY}]
+  let pbIndex       = 0;    // which sentence skip-back/fwd navigates
+
+  // Suppress the click event that fires immediately after a stroke mouseup,
+  // so it doesn't dismiss the player we just showed.
+  let suppressNextClick = false;
+
+  // Article mode — filters nav/ads/footer from sentence collection
+  let articleModeEnabled = true; // default matches popup toggle (checked)
+
+  // ── Audio playback state ──────────────────────────────────────────
+  let pbAudio       = null;   // current Audio element
+  let pbState       = 'idle'; // 'idle' | 'loading' | 'playing' | 'paused' | 'error'
+  let pbRequestId   = 0;      // monotonic counter to discard stale TTS responses
+  let cachedVoice   = '21m00Tcm4TlvDq8ikWAM';
+  let cachedSpeed   = 1.0;
+
+  // ── Load settings and listen for changes ──────────────────────────
+  chrome.storage.local.get(
+    ['articleMode', 'defaultVoice', 'defaultSpeed'],
+    (data) => {
+      if (data.articleMode !== undefined) articleModeEnabled = data.articleMode;
+      if (data.defaultVoice) cachedVoice = data.defaultVoice;
+      if (data.defaultSpeed) cachedSpeed = parseFloat(data.defaultSpeed) || 1.0;
+    }
+  );
+  chrome.storage.onChanged.addListener((changes) => {
+    if (changes.articleMode)  articleModeEnabled = changes.articleMode.newValue;
+    if (changes.defaultVoice) cachedVoice = changes.defaultVoice.newValue;
+    if (changes.defaultSpeed) cachedSpeed = parseFloat(changes.defaultSpeed.newValue) || 1.0;
+  });
+
+  // ── DOM elements (lazily created) ──────────────────────────────────
+  let cursorEl      = null;
+  let strokeOverlay = null;
+  let strokePath    = null;
+  let indicatorEl   = null;
+  let playerEl      = null;
+  let menuPanelEl   = null;
+  let toastEl       = null;
+  let toastTimer    = 0;
+
+  const CURSOR_SIZE    = 32;
+  const LINE_TOLERANCE = 14;  // for END line detection (confirmed working)
+  const SPEEDS         = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+
+  // ── Initialization ─────────────────────────────────────────────────
+  function ensureElements() {
+    if (cursorEl) return;
+
+    cursorEl = document.createElement('div');
+    cursorEl.className = 'highlighter-cursor';
+    cursorEl.style.width  = CURSOR_SIZE + 'px';
+    cursorEl.style.height = CURSOR_SIZE + 'px';
+    document.documentElement.appendChild(cursorEl);
+
+    strokeOverlay = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    strokeOverlay.classList.add('highlighter-stroke-overlay');
+    document.documentElement.appendChild(strokeOverlay);
+
+    strokePath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    strokePath.setAttribute('fill', 'none');
+    strokePath.setAttribute('stroke', 'rgba(180, 130, 255, 0.5)');
+    strokePath.setAttribute('stroke-width', CURSOR_SIZE.toString());
+    strokePath.setAttribute('stroke-linecap', 'round');
+    strokePath.setAttribute('stroke-linejoin', 'round');
+    strokeOverlay.appendChild(strokePath);
+
+    indicatorEl = document.createElement('div');
+    indicatorEl.className = 'highlighter-indicator';
+    indicatorEl.textContent = 'Highlight Mode';
+    document.documentElement.appendChild(indicatorEl);
+
+    buildPlayer();
+
+    toastEl = document.createElement('div');
+    toastEl.className = 'hltr-toast';
+    document.documentElement.appendChild(toastEl);
+  }
+
+  // ── Mode toggle ────────────────────────────────────────────────────
+  function enterHighlightMode() {
+    if (highlightMode) return;
+    ensureElements();
+    highlightMode = true;
+    document.documentElement.classList.add('highlighter-mode');
+    indicatorEl.classList.add('visible');
+  }
+
+  function exitHighlightMode() {
+    if (!highlightMode) return;
+    highlightMode = false;
+    isPainting    = false;
+    strokePoints  = [];
+    document.documentElement.classList.remove('highlighter-mode');
+    if (indicatorEl) indicatorEl.classList.remove('visible');
+    clearStroke();
+  }
+
+  function toggleHighlightMode() {
+    highlightMode ? exitHighlightMode() : enterHighlightMode();
+  }
+
+  // ── Stroke rendering ───────────────────────────────────────────────
+  function buildPathData(points) {
+    if (!points.length) return '';
+    if (points.length === 1) {
+      return `M${points[0].x},${points[0].y}L${points[0].x + 0.1},${points[0].y}`;
+    }
+    let d = `M${points[0].x},${points[0].y}`;
+    for (let i = 1; i < points.length; i++) d += `L${points[i].x},${points[i].y}`;
+    return d;
+  }
+
+  function renderStroke() {
+    if (strokePath) strokePath.setAttribute('d', buildPathData(strokePoints));
+  }
+
+  function clearStroke() {
+    strokePoints = [];
+    if (strokePath) strokePath.setAttribute('d', '');
+  }
+
+  // ── Text selection resolution ──────────────────────────────────────
+  function estimateLineHeight(pt) {
+    const el = document.elementFromPoint(pt.x, pt.y);
+    if (!el) return 24;
+    const style = window.getComputedStyle(el);
+    const lh = parseFloat(style.lineHeight);
+    // Cap at 48px — large headings can report huge line heights that would
+    // make the start-tolerance so wide it reaches lines far above the stroke.
+    if (!isNaN(lh) && lh >= 8 && lh <= 48) return lh;
+    const fs = parseFloat(style.fontSize) || 16;
+    return Math.min(fs * 1.5, 48);
+  }
+
+  // ── DOM range hit-test for stroke start ───────────────────────────
+  /**
+   * Returns the index of the first sentence the stroke start point falls on.
+   *
+   * Three paths:
+   *   1. Reliable caret  — caretRangeFromPoint snapped to the correct line;
+   *                        use Range.compareBoundaryPoints for exact match.
+   *   2. Blank space     — caret snapped to a line ABOVE topPt (inter-paragraph
+   *                        gap); find first sentence just at/after topPt.y.
+   *   3. No caret        — geometry fallback with estimated lineHeight tolerance.
+   */
+  function findFirstSentenceIdx(sentences, topPt, lineHeight) {
+    let caretRange = null;
+    if (document.caretRangeFromPoint) {
+      caretRange = document.caretRangeFromPoint(topPt.x, topPt.y);
+    } else if (document.caretPositionFromPoint) {
+      const pos = document.caretPositionFromPoint(topPt.x, topPt.y);
+      if (pos) {
+        caretRange = document.createRange();
+        caretRange.setStart(pos.offsetNode, pos.offset);
+        caretRange.collapse(true);
+      }
+    }
+
+    if (caretRange) {
+      const rects  = caretRange.getClientRects();
+      const caretY = rects.length ? rects[0].top : null;
+
+      if (caretY !== null) {
+        // Line height of the element the caret actually snapped to
+        const node  = caretRange.startContainer;
+        const el    = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+        const style = el ? window.getComputedStyle(el) : null;
+        const lh    = style ? parseFloat(style.lineHeight) : NaN;
+        const fs    = style ? parseFloat(style.fontSize)   : NaN;
+        const caretLH = (!isNaN(lh) && lh > 0) ? lh
+                      : ((!isNaN(fs) && fs > 0) ? fs * 1.4 : 24);
+
+        if (caretY <= topPt.y + 4 && topPt.y < caretY + caretLH) {
+          // ── Path 1: caret on the correct line ─────────────────────────
+          for (let i = 0; i < sentences.length; i++) {
+            try {
+              const startCmp = sentences[i].range.compareBoundaryPoints(
+                Range.START_TO_START, caretRange);
+              const endCmp   = sentences[i].range.compareBoundaryPoints(
+                Range.END_TO_START, caretRange);
+              if (startCmp <= 0 && endCmp >= 0) return i;
+            } catch { continue; }
+          }
+          // Caret is past all sentence content — return first sentence after caret
+          for (let i = 0; i < sentences.length; i++) {
+            try {
+              if (sentences[i].range.compareBoundaryPoints(
+                  Range.START_TO_START, caretRange) >= 0) return i;
+            } catch { continue; }
+          }
+          return sentences.length - 1;
+        }
+
+        if (topPt.y >= caretY + caretLH) {
+          // ── Path 2: caret snapped to line ABOVE topPt (blank space) ───
+          // Do NOT use wide lineHeight tolerance here — that's the bug.
+          // Find the first sentence at or just below topPt.y.
+          const idx = sentences.findIndex(s => s.startLineY >= topPt.y - 6);
+          return idx !== -1 ? idx : sentences.length - 1;
+        }
+      }
+    }
+
+    // ── Path 3: no caret available — geometry fallback ────────────────
+    const tol = Math.min(lineHeight - 1, 47);
+    return sentences.findIndex(s => s.startLineY >= topPt.y - tol);
+  }
+
+  function resolveAndSelect(startPt, endPt) {
+    const topPt = startPt.y <= endPt.y ? startPt : endPt;
+    const botPt = startPt.y <= endPt.y ? endPt   : startPt;
+
+    const sentences = collectSentences();
+    if (!sentences.length) return;
+
+    const lineHeight = estimateLineHeight(topPt);
+
+    const firstIdx = findFirstSentenceIdx(sentences, topPt, lineHeight);
+    if (firstIdx === -1) return;
+
+    const botY = getLineTopAtPoint(botPt);
+
+    let lastIdx = -1;
+    for (let i = firstIdx; i < sentences.length; i++) {
+      if (sentences[i].endLineY > botY + LINE_TOLERANCE) break;
+      if (sentences[i].endLineY <= botY + LINE_TOLERANCE) lastIdx = i;
+    }
+    if (lastIdx === -1) return;
+
+    const selected = sentences.slice(firstIdx, lastIdx + 1);
+    try {
+      const range = document.createRange();
+      range.setStart(selected[0].range.startContainer, selected[0].range.startOffset);
+      range.setEnd(selected[selected.length - 1].range.endContainer,
+                   selected[selected.length - 1].range.endOffset);
+
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+
+      // Store sentences for playback navigation
+      pbSentences = selected;
+      pbIndex     = 0;
+
+      showPlayer();
+    } catch (e) {
+      console.error('[Highlighter] Selection error:', e);
+    }
+  }
+
+  function getLineTopAtPoint(pt) {
+    let range = null;
+    if (document.caretRangeFromPoint) {
+      range = document.caretRangeFromPoint(pt.x, pt.y);
+    } else if (document.caretPositionFromPoint) {
+      const pos = document.caretPositionFromPoint(pt.x, pt.y);
+      if (pos) {
+        range = document.createRange();
+        range.setStart(pos.offsetNode, pos.offset);
+        range.collapse(true);
+      }
+    }
+    if (range) {
+      const rects = range.getClientRects();
+      if (rects.length) return rects[0].top;
+    }
+    const el = document.elementFromPoint(pt.x, pt.y);
+    return el ? el.getBoundingClientRect().top : pt.y;
+  }
+
+  // ── Article mode helpers ──────────────────────────────────────────
+  function getContentRoot() {
+    return document.querySelector('main, [role="main"], article') || document.body;
+  }
+
+  function isNonContent(el) {
+    return el.closest(
+      'nav, header, footer, aside, ' +
+      '[role="navigation"], [role="banner"], [role="contentinfo"], [role="complementary"]'
+    ) !== null;
+  }
+
+  // ── Sentence collection ────────────────────────────────────────────
+  function collectSentences() {
+    const results = [];
+    const seen    = new Set();
+
+    const root = articleModeEnabled ? getContentRoot() : document.body;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    let textNode;
+    while ((textNode = walker.nextNode())) {
+      if (!textNode.textContent.trim()) continue;
+      const block = nearestLeafBlock(textNode);
+      if (!block || seen.has(block)) continue;
+      seen.add(block);
+      if (!isElementVisible(block)) continue;
+      if (articleModeEnabled && isNonContent(block)) continue;
+      const sents = extractSentencesFromBlock(block);
+      for (const s of sents) results.push(s);
+    }
+
+    results.sort((a, b) => a.startLineY - b.startLineY);
+    return results;
+  }
+
+  const BLOCK_DISPLAYS = new Set([
+    'block', 'flex', 'grid', 'list-item',
+    'table', 'table-row', 'table-cell', 'table-caption',
+  ]);
+
+  function nearestLeafBlock(textNode) {
+    let el = textNode.parentElement;
+    while (el && el !== document.body) {
+      const display = window.getComputedStyle(el).display;
+      if (BLOCK_DISPLAYS.has(display)) {
+        let hasBlockChild = false;
+        for (const child of el.children) {
+          if (BLOCK_DISPLAYS.has(window.getComputedStyle(child).display)) {
+            hasBlockChild = true;
+            break;
+          }
+        }
+        if (!hasBlockChild) return el;
+        return textNode.parentElement;
+      }
+      el = el.parentElement;
+    }
+    return textNode.parentElement;
+  }
+
+  function isElementVisible(el) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+  }
+
+  function extractSentencesFromBlock(el) {
+    const text = el.textContent;
+    if (!text.trim()) return [];
+
+    const results    = [];
+    const sentenceRe = /[^!.?…]*(?:[!.?…]+['"'"]?\s*)/g;
+    let match, consumed = 0;
+
+    while ((match = sentenceRe.exec(text)) !== null) {
+      const raw = match[0];
+      if (!raw.trim()) { consumed = match.index + raw.length; continue; }
+      const charStart = match.index;
+      const charEnd   = match.index + raw.length;
+      consumed = charEnd;
+
+      const range = charOffsetsToRange(el, charStart, charEnd);
+      if (!range) continue;
+      const rects = range.getClientRects();
+      if (!rects.length) continue;
+
+      results.push({
+        text: raw.trim(),
+        range,
+        startLineY: rects[0].top,
+        endLineY:   rects[rects.length - 1].top,
+      });
+    }
+
+    const tail = text.slice(consumed).trim();
+    if (tail) {
+      const range = charOffsetsToRange(el, consumed, text.length);
+      if (range) {
+        const rects = range.getClientRects();
+        if (rects.length) {
+          results.push({
+            text: tail,
+            range,
+            startLineY: rects[0].top,
+            endLineY:   rects[rects.length - 1].top,
+          });
+        }
+      }
+    }
+
+    return results;
+  }
+
+  function charOffsetsToRange(container, charStart, charEnd) {
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+    let pos = 0, startNode = null, startOff = 0, endNode = null, endOff = 0, node;
+
+    while ((node = walker.nextNode())) {
+      const len = node.textContent.length;
+      if (!startNode && pos + len > charStart) {
+        startNode = node;
+        startOff  = charStart - pos;
+      }
+      if (!endNode && pos + len >= charEnd) {
+        endNode = node;
+        endOff  = charEnd - pos;
+        break;
+      }
+      pos += len;
+    }
+
+    if (!startNode || !endNode) return null;
+    try {
+      const range = document.createRange();
+      range.setStart(startNode, startOff);
+      range.setEnd(endNode, endOff);
+      return range;
+    } catch { return null; }
+  }
+
+  // ── Floating player ────────────────────────────────────────────────
+  function buildPlayer() {
+    // ── Player pill ──
+    playerEl = document.createElement('div');
+    playerEl.className = 'hltr-player';
+    playerEl.innerHTML = `
+      <button class="hltr-btn hltr-skip-back" title="Previous sentence">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor">
+          <path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/>
+        </svg>
+      </button>
+      <button class="hltr-btn hltr-play-pause" title="Play">
+        <svg class="hltr-icon-play" viewBox="0 0 24 24" width="21" height="21" fill="currentColor">
+          <path d="M8 5v14l11-7z"/>
+        </svg>
+        <svg class="hltr-icon-pause" viewBox="0 0 24 24" width="21" height="21" fill="currentColor" style="display:none">
+          <path d="M6 19h4V5H6zm8-14v14h4V5z"/>
+        </svg>
+      </button>
+      <button class="hltr-btn hltr-skip-fwd" title="Next sentence">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor">
+          <path d="M6 18l8.5-6L6 6v12zm2-8.14L11.03 12 8 14.14V9.86zM16 6h2v12h-2z"/>
+        </svg>
+      </button>
+      <div class="hltr-divider"></div>
+      <button class="hltr-btn hltr-menu-btn" title="Settings">
+        <svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor">
+          <circle cx="5" cy="12" r="1.8"/>
+          <circle cx="12" cy="12" r="1.8"/>
+          <circle cx="19" cy="12" r="1.8"/>
+        </svg>
+      </button>
+    `;
+    document.documentElement.appendChild(playerEl);
+
+    // ── Menu panel ──
+    menuPanelEl = document.createElement('div');
+    menuPanelEl.className = 'hltr-menu-panel';
+    menuPanelEl.innerHTML = `
+      <div class="hltr-menu-row">
+        <label class="hltr-menu-label">Voice</label>
+        <select class="hltr-voice-select"></select>
+      </div>
+      <div class="hltr-menu-row">
+        <label class="hltr-menu-label">Speed</label>
+        <div class="hltr-speed-row">
+          <input type="range" class="hltr-speed-slider" min="0" max="5" step="1" value="2">
+          <span class="hltr-speed-label">1.0x</span>
+        </div>
+      </div>
+    `;
+    document.documentElement.appendChild(menuPanelEl);
+
+    // Load saved settings into menu controls
+    chrome.storage.local.get(['defaultVoice', 'defaultSpeed'], (data) => {
+      const voiceSelect = menuPanelEl.querySelector('.hltr-voice-select');
+      ensureVoiceOption(voiceSelect, data.defaultVoice || cachedVoice, 'Configured voice');
+      loadVoiceOptions(voiceSelect, data.defaultVoice || cachedVoice);
+
+      if (data.defaultVoice) {
+        if (voiceSelect) voiceSelect.value = data.defaultVoice;
+      }
+      if (data.defaultSpeed) {
+        const idx = SPEEDS.indexOf(parseFloat(data.defaultSpeed));
+        if (idx !== -1) {
+          menuPanelEl.querySelector('.hltr-speed-slider').value = idx;
+          menuPanelEl.querySelector('.hltr-speed-label').textContent =
+            parseFloat(data.defaultSpeed) + 'x';
+        }
+      }
+    });
+
+    // Button wiring
+    playerEl.querySelector('.hltr-skip-back').addEventListener('click', (e) => {
+      e.stopPropagation();
+      navigateSentence(-1);
+    });
+    playerEl.querySelector('.hltr-play-pause').addEventListener('click', (e) => {
+      e.stopPropagation();
+      onPlayPause();
+    });
+    playerEl.querySelector('.hltr-skip-fwd').addEventListener('click', (e) => {
+      e.stopPropagation();
+      navigateSentence(+1);
+    });
+    playerEl.querySelector('.hltr-menu-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleMenu();
+    });
+
+    // Speed slider
+    const slider = menuPanelEl.querySelector('.hltr-speed-slider');
+    const speedLbl = menuPanelEl.querySelector('.hltr-speed-label');
+    slider.addEventListener('input', () => {
+      const speed = SPEEDS[parseInt(slider.value)];
+      cachedSpeed = speed;
+      speedLbl.textContent = speed + 'x';
+      chrome.storage.local.set({ defaultSpeed: speed.toString() });
+    });
+
+    // Voice select
+    menuPanelEl.querySelector('.hltr-voice-select').addEventListener('change', (e) => {
+      cachedVoice = e.target.value;
+      chrome.storage.local.set({ defaultVoice: e.target.value });
+    });
+
+    // Drag
+    playerEl.addEventListener('mousedown', onPlayerDragStart);
+
+    // Close menu when clicking outside
+    document.addEventListener('mousedown', (e) => {
+      if (menuPanelEl.classList.contains('hltr-visible') &&
+          !menuPanelEl.contains(e.target) &&
+          !playerEl.contains(e.target)) {
+        closeMenu();
+      }
+    }, true);
+  }
+
+  // ── Player positioning & visibility ───────────────────────────────
+  function showPlayer() {
+    if (!playerEl) return;
+    // Restore saved position, or default to top-right (near the indicator badge)
+    chrome.storage.local.get('playerPos', (data) => {
+      const pw = playerEl.offsetWidth  || 200;
+      const ph = playerEl.offsetHeight || 54;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const margin = 12;
+
+      let left, top;
+      if (data.playerPos) {
+        // Clamp saved position in case viewport size changed
+        left = Math.max(margin, Math.min(data.playerPos.left, vw - pw - margin));
+        top  = Math.max(margin, Math.min(data.playerPos.top,  vh - ph - margin));
+      } else {
+        // Default: top-right, same corner as the "Highlight Mode" badge
+        left = vw - pw - margin;
+        top  = margin;
+      }
+
+      playerEl.style.left = left + 'px';
+      playerEl.style.top  = top  + 'px';
+      playerEl.classList.add('hltr-visible');
+    });
+  }
+
+  function hidePlayer() {
+    if (!playerEl) return;
+    stopPlayback();
+    playerEl.classList.remove('hltr-visible');
+    closeMenu();
+    pbSentences = [];
+    pbIndex     = 0;
+  }
+
+  // ── Menu ───────────────────────────────────────────────────────────
+  function toggleMenu() {
+    menuPanelEl.classList.contains('hltr-visible') ? closeMenu() : openMenu();
+  }
+
+  function openMenu() {
+    if (!playerEl || !menuPanelEl) return;
+    const pr  = playerEl.getBoundingClientRect();
+    const mpw = 230;
+    const mph = menuPanelEl.offsetHeight || 110;
+    const vw  = window.innerWidth;
+    const vh  = window.innerHeight;
+
+    let top  = pr.top - mph - 8;
+    if (top < 8) top = pr.bottom + 8;
+    top = Math.max(8, Math.min(top, vh - mph - 8));
+
+    let left = pr.left + (pr.width - mpw) / 2;
+    left = Math.max(8, Math.min(left, vw - mpw - 8));
+
+    menuPanelEl.style.left  = left + 'px';
+    menuPanelEl.style.top   = top  + 'px';
+    menuPanelEl.style.width = mpw  + 'px';
+    menuPanelEl.classList.add('hltr-visible');
+  }
+
+  function closeMenu() {
+    if (menuPanelEl) menuPanelEl.classList.remove('hltr-visible');
+  }
+
+  // ── Player drag ────────────────────────────────────────────────────
+  let _dragOffX = 0, _dragOffY = 0;
+
+  function onPlayerDragStart(e) {
+    // Don't start drag if clicking a button
+    if (e.target.closest('.hltr-btn')) return;
+    e.preventDefault();
+    playerEl.classList.add('hltr-dragging');
+    const rect = playerEl.getBoundingClientRect();
+    _dragOffX = e.clientX - rect.left;
+    _dragOffY = e.clientY - rect.top;
+    document.addEventListener('mousemove', onPlayerDragMove, true);
+    document.addEventListener('mouseup',   onPlayerDragEnd,  true);
+  }
+
+  function onPlayerDragMove(e) {
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const pw = playerEl.offsetWidth;
+    const ph = playerEl.offsetHeight;
+    let left = e.clientX - _dragOffX;
+    let top  = e.clientY - _dragOffY;
+    left = Math.max(0, Math.min(left, vw - pw));
+    top  = Math.max(0, Math.min(top,  vh - ph));
+    playerEl.style.left = left + 'px';
+    playerEl.style.top  = top  + 'px';
+    // Reposition menu if open
+    if (menuPanelEl.classList.contains('hltr-visible')) openMenu();
+  }
+
+  function onPlayerDragEnd() {
+    playerEl.classList.remove('hltr-dragging');
+    document.removeEventListener('mousemove', onPlayerDragMove, true);
+    document.removeEventListener('mouseup',   onPlayerDragEnd,  true);
+    // Persist position so it survives page reloads and new Chrome sessions
+    chrome.storage.local.set({
+      playerPos: {
+        left: parseInt(playerEl.style.left, 10),
+        top:  parseInt(playerEl.style.top,  10),
+      }
+    });
+  }
+
+  // ── Sentence navigation ────────────────────────────────────────────
+  function navigateSentence(delta) {
+    if (!pbSentences.length) return;
+    const newIdx = Math.max(0, Math.min(pbSentences.length - 1, pbIndex + delta));
+    if (newIdx === pbIndex) return;
+    // If actively playing, play the new sentence; otherwise just highlight
+    if (pbState === 'playing' || pbState === 'loading') {
+      playSentence(newIdx);
+    } else {
+      pbIndex = newIdx;
+      highlightSentence(newIdx);
+    }
+  }
+
+  function highlightSentence(idx) {
+    const s = pbSentences[idx];
+    if (!s) return;
+    try {
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(s.range.cloneRange());
+    } catch { /* ignore */ }
+  }
+
+  // ── Audio playback ────────────────────────────────────────────────
+  function setPlaybackState(state) {
+    pbState = state;
+    if (!playerEl) return;
+
+    const playIcon  = playerEl.querySelector('.hltr-icon-play');
+    const pauseIcon = playerEl.querySelector('.hltr-icon-pause');
+    const playBtn   = playerEl.querySelector('.hltr-play-pause');
+
+    playerEl.classList.remove('hltr-error');
+    playBtn.classList.remove('hltr-loading');
+
+    switch (state) {
+      case 'idle':
+        playIcon.style.display  = '';
+        pauseIcon.style.display = 'none';
+        playBtn.title = 'Play';
+        break;
+      case 'loading':
+        playIcon.style.display  = 'none';
+        pauseIcon.style.display = 'none';
+        playBtn.classList.add('hltr-loading');
+        playBtn.title = 'Loading\u2026';
+        break;
+      case 'playing':
+        playIcon.style.display  = 'none';
+        pauseIcon.style.display = '';
+        playBtn.title = 'Pause';
+        break;
+      case 'paused':
+        playIcon.style.display  = '';
+        pauseIcon.style.display = 'none';
+        playBtn.title = 'Resume';
+        break;
+      case 'error':
+        playIcon.style.display  = '';
+        pauseIcon.style.display = 'none';
+        playerEl.classList.add('hltr-error');
+        playBtn.title = 'Retry';
+        break;
+    }
+  }
+
+  function onPlayPause() {
+    switch (pbState) {
+      case 'idle':
+      case 'error':
+        if (!pbSentences.length) return;
+        playSentence(pbIndex);
+        break;
+      case 'loading':
+        stopPlayback();
+        break;
+      case 'playing':
+        pausePlayback();
+        break;
+      case 'paused':
+        resumePlayback();
+        break;
+    }
+  }
+
+  function playSentence(idx) {
+    // Stop any current audio
+    if (pbAudio) {
+      pbAudio.pause();
+      pbAudio.removeAttribute('src');
+      pbAudio = null;
+    }
+
+    if (idx < 0 || idx >= pbSentences.length) {
+      setPlaybackState('idle');
+      return;
+    }
+
+    pbIndex = idx;
+    highlightSentence(idx);
+    setPlaybackState('loading');
+
+    const requestId = ++pbRequestId;
+
+    // Read current voice/speed from the in-page menu controls
+    const voice = menuPanelEl
+      ? (menuPanelEl.querySelector('.hltr-voice-select')?.value || cachedVoice)
+      : cachedVoice;
+    const speedSlider = menuPanelEl
+      ? menuPanelEl.querySelector('.hltr-speed-slider')
+      : null;
+    const speed = speedSlider
+      ? (SPEEDS[parseInt(speedSlider.value)] || cachedSpeed)
+      : cachedSpeed;
+
+    chrome.runtime.sendMessage(
+      { type: 'tts-request', text: pbSentences[idx].text, voice, speed },
+      (response) => {
+        // Discard stale responses (user skipped or cancelled)
+        if (requestId !== pbRequestId) return;
+
+        if (chrome.runtime.lastError || !response || !response.ok) {
+          console.error('[Highlighter TTS] Response failure:', {
+            runtimeError: chrome.runtime.lastError?.message || null,
+            response,
+          });
+          const errMsg = chrome.runtime.lastError
+            ? 'Extension error: ' + chrome.runtime.lastError.message
+            : getErrorMessage(response);
+          console.warn('[Highlighter TTS]', errMsg, '— falling back to speechSynthesis');
+          showPlayerWarning(errMsg);
+          fallbackSpeechSynthesis(pbSentences[idx].text, speed, requestId);
+          return;
+        }
+
+        playAudioDataUrl(response.audioDataUrl, requestId, speed);
+      }
+    );
+  }
+
+  function pausePlayback() {
+    if (pbAudio) pbAudio.pause();
+    else if (window.speechSynthesis) window.speechSynthesis.pause();
+    setPlaybackState('paused');
+  }
+
+  function resumePlayback() {
+    if (pbAudio) {
+      pbAudio.play()
+        .then(() => setPlaybackState('playing'))
+        .catch(() => showPlayerError('Playback failed'));
+    } else if (window.speechSynthesis && window.speechSynthesis.paused) {
+      window.speechSynthesis.resume();
+      setPlaybackState('playing');
+    } else {
+      playSentence(pbIndex);
+    }
+  }
+
+  function playAudioDataUrl(dataUrl, requestId, speed) {
+    const playbackRate = normalizePlaybackRate(speed);
+    pbAudio = new Audio(dataUrl);
+    pbAudio.playbackRate = playbackRate;
+    pbAudio.addEventListener('ended', onAudioEnded);
+    pbAudio.addEventListener('error', () => {
+      if (requestId !== pbRequestId) return;
+      showPlayerError('Audio decode error');
+    });
+    pbAudio.play()
+      .then(() => {
+        if (requestId !== pbRequestId) return;
+        setPlaybackState('playing');
+      })
+      .catch((err) => {
+        if (requestId !== pbRequestId) return;
+        showPlayerError('Playback blocked: ' + err.message);
+      });
+  }
+
+  function fallbackSpeechSynthesis(text, speed, requestId) {
+    if (requestId !== pbRequestId) return;
+    if (!window.speechSynthesis) {
+      showPlayerError('No TTS available');
+      return;
+    }
+    window.speechSynthesis.cancel();
+    const utter = new SpeechSynthesisUtterance(text);
+    utter.rate = typeof speed === 'number' ? speed : 1.0;
+    utter.onend = () => {
+      if (requestId !== pbRequestId) return;
+      onAudioEnded();
+    };
+    utter.onerror = (e) => {
+      if (requestId !== pbRequestId) return;
+      if (e.error === 'canceled' || e.error === 'interrupted') return;
+      showPlayerError('Speech synthesis error');
+    };
+    utter.onstart = () => {
+      if (requestId !== pbRequestId) return;
+      setPlaybackState('playing');
+    };
+    window.speechSynthesis.speak(utter);
+  }
+
+  function stopPlayback() {
+    pbRequestId++; // invalidate in-flight requests
+    if (pbAudio) {
+      pbAudio.pause();
+      pbAudio.removeAttribute('src');
+      pbAudio = null;
+    }
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    setPlaybackState('idle');
+  }
+
+  function onAudioEnded() {
+    if (pbIndex < pbSentences.length - 1) {
+      playSentence(pbIndex + 1);
+    } else {
+      // All sentences done — reset
+      setPlaybackState('idle');
+    }
+  }
+
+  function getErrorMessage(response) {
+    if (!response) return 'No response from background';
+    switch (response.error) {
+      case 'no-token':          return 'Set ElevenLabs API key in extension settings';
+      case 'empty-text':        return 'Select some text before playing';
+      case 'auth-failed':       return response.detail
+        ? `Authentication failed\n${truncateDetail(response.detail)}`
+        : 'Invalid API key';
+      case 'billing-required':  return 'API error (402)\nCheck ElevenLabs billing/quota';
+      case 'rate-limited':      return 'Rate limited — try again shortly';
+      case 'api-error':         return response.detail
+        ? `API error (${response.status})\n${truncateDetail(response.detail)}`
+        : `API error (${response.status})`;
+      default:                  return response.error || 'Unknown error';
+    }
+  }
+
+  function normalizePlaybackRate(speed) {
+    const parsed = parseFloat(speed);
+    if (!Number.isFinite(parsed)) return 1.0;
+    return Math.max(0.5, Math.min(2.0, parsed));
+  }
+
+  function ensureVoiceOption(selectEl, voiceId, label) {
+    if (!selectEl || !voiceId) return;
+    const existing = Array.from(selectEl.options).find((option) => option.value === voiceId);
+    if (existing) {
+      existing.textContent = label || existing.textContent;
+      selectEl.value = voiceId;
+      return;
+    }
+
+    const option = document.createElement('option');
+    option.value = voiceId;
+    option.textContent = label || voiceId;
+    selectEl.replaceChildren(option);
+    selectEl.value = voiceId;
+  }
+
+  function loadVoiceOptions(selectEl, selectedVoice) {
+    if (!selectEl) return;
+    chrome.runtime.sendMessage({ type: 'voices-request' }, (response) => {
+      if (chrome.runtime.lastError || !response || !response.ok || !response.voices?.length) {
+        ensureVoiceOption(selectEl, selectedVoice || cachedVoice, 'Configured voice');
+        return;
+      }
+
+      const groups = new Map();
+      for (const voice of response.voices) {
+        const category = voice.category || 'Other';
+        if (!groups.has(category)) groups.set(category, []);
+        groups.get(category).push(voice);
+      }
+
+      const fragment = document.createDocumentFragment();
+      for (const [category, voices] of groups) {
+        const optgroup = document.createElement('optgroup');
+        optgroup.label = category;
+        for (const voice of voices) {
+          const option = document.createElement('option');
+          option.value = voice.voiceId;
+          option.textContent = voice.name;
+          optgroup.appendChild(option);
+        }
+        fragment.appendChild(optgroup);
+      }
+
+      selectEl.replaceChildren(fragment);
+      selectEl.value = selectedVoice || cachedVoice;
+      if (!selectEl.value) ensureVoiceOption(selectEl, selectedVoice || cachedVoice, 'Configured voice');
+    });
+  }
+
+  function truncateDetail(detail) {
+    const text = typeof detail === 'string' ? detail.trim() : '';
+    if (!text) return 'Unknown upstream error';
+    return text.length > 140 ? text.slice(0, 137) + '...' : text;
+  }
+
+  function showPlayerError(msg) {
+    setPlaybackState('error');
+    console.warn('[Highlighter TTS]', msg);
+    showToast(msg, true);
+    setTimeout(() => {
+      if (pbState === 'error') setPlaybackState('idle');
+    }, 4000);
+  }
+
+  // Flash error tooltip without blocking playback (used before fallback)
+  function showPlayerWarning(msg) {
+    showToast(msg, false);
+  }
+
+  function showToast(msg, isError) {
+    if (!toastEl) return;
+    clearTimeout(toastTimer);
+    toastEl.textContent = msg;
+    toastEl.classList.toggle('hltr-visible', true);
+    toastEl.classList.toggle('hltr-error', isError);
+    positionToast();
+    toastTimer = setTimeout(() => {
+      toastEl.classList.remove('hltr-visible', 'hltr-error');
+      toastTimer = 0;
+    }, 4000);
+  }
+
+  function positionToast() {
+    if (!toastEl || !playerEl) return;
+    const margin = 12;
+    const playerRect = playerEl.getBoundingClientRect();
+    const toastWidth = Math.min(420, window.innerWidth - margin * 2);
+    toastEl.style.maxWidth = toastWidth + 'px';
+    toastEl.style.width = toastWidth + 'px';
+
+    const measuredHeight = toastEl.offsetHeight || 72;
+    let left = playerRect.left + (playerRect.width - toastWidth) / 2;
+    left = Math.max(margin, Math.min(left, window.innerWidth - toastWidth - margin));
+
+    let top = playerRect.bottom + 8;
+    if (top + measuredHeight > window.innerHeight - margin) {
+      top = Math.max(margin, playerRect.top - measuredHeight - 8);
+    }
+
+    toastEl.style.left = left + 'px';
+    toastEl.style.top = top + 'px';
+  }
+
+  // ── Mouse handling ─────────────────────────────────────────────────
+  function onMouseMove(e) {
+    if (!highlightMode) return;
+    if (cursorEl) {
+      cursorEl.style.left = e.clientX + 'px';
+      cursorEl.style.top  = e.clientY + 'px';
+    }
+    if (isPainting) {
+      strokePoints.push({ x: e.clientX, y: e.clientY });
+      renderStroke();
+    }
+  }
+
+  function onMouseDown(e) {
+    if (!highlightMode) return;
+    if (e.button !== 0) return;
+    // Don't start a stroke if clicking the player or settings menu
+    if (playerEl && playerEl.contains(e.target)) return;
+    if (menuPanelEl && menuPanelEl.contains(e.target)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    isPainting   = true;
+    strokePoints = [{ x: e.clientX, y: e.clientY }];
+    renderStroke();
+  }
+
+  function onMouseUp(e) {
+    if (!highlightMode) return;
+    if (!isPainting) return;
+    e.preventDefault();
+    e.stopPropagation();
+    isPainting = false;
+
+    const startPt = strokePoints[0];
+    const endPt   = strokePoints[strokePoints.length - 1];
+
+    resolveAndSelect(startPt, endPt);
+    suppressNextClick = true;   // prevent the trailing click from dismissing the player
+    setTimeout(() => { suppressNextClick = false; }, 500);  // safety: clear if click never fires
+    setTimeout(() => clearStroke(), 150);
+
+    if (!e.shiftKey && !e.metaKey && !e.ctrlKey) exitHighlightMode();
+  }
+
+  function onClickCapture(e) {
+    // The click that immediately follows a stroke mouseup should be swallowed —
+    // it would otherwise dismiss the player we just showed.
+    if (suppressNextClick) {
+      suppressNextClick = false;
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    // Let clicks through to the player/menu
+    if (playerEl   && playerEl.contains(e.target))    return;
+    if (menuPanelEl && menuPanelEl.contains(e.target)) return;
+
+    if (!highlightMode) {
+      // Clicking outside selection while player is visible clears everything
+      const sel = window.getSelection();
+      if (playerEl && playerEl.classList.contains('hltr-visible')) {
+        sel?.removeAllRanges();
+        hidePlayer();
+      }
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  // ── Keyboard handling ──────────────────────────────────────────────
+  function onKeyDown(e) {
+    if (e.key === 'Escape') {
+      if (highlightMode) exitHighlightMode();
+      window.getSelection()?.removeAllRanges();
+      hidePlayer();
+    }
+  }
+
+  // ── Event listeners ────────────────────────────────────────────────
+  document.addEventListener('mousemove', onMouseMove,    true);
+  document.addEventListener('mousedown', onMouseDown,    true);
+  document.addEventListener('mouseup',   onMouseUp,      true);
+  document.addEventListener('click',     onClickCapture, true);
+  document.addEventListener('keydown',   onKeyDown,      true);
+
+  // ── Message listener ───────────────────────────────────────────────
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (msg.action === 'toggleHighlightMode') toggleHighlightMode();
+  });
+})();

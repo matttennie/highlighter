@@ -1,0 +1,10 @@
+{
+  "name": "highlighter-tts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Chrome extension: select text with a paint-brush stroke and hear it read aloud via ElevenLabs TTS",
+  "scripts": {
+    "test": "node --test tests/*.js"
+  }
+}

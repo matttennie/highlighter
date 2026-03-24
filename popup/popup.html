@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      width: 300px;
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      padding: 16px;
+      color: #1a1a1a;
+    }
+    h1 {
+      font-size: 16px;
+      font-weight: 600;
+      margin-bottom: 12px;
+    }
+    .field {
+      margin-bottom: 12px;
+    }
+    label {
+      display: block;
+      font-size: 12px;
+      font-weight: 500;
+      color: #666;
+      margin-bottom: 4px;
+    }
+    input[type="password"],
+    input[type="text"],
+    select {
+      width: 100%;
+      padding: 6px 8px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+      font-size: 13px;
+    }
+    .hint {
+      font-size: 11px;
+      color: #999;
+      margin-top: 2px;
+    }
+    .toggle-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 0;
+    }
+    .toggle-row label {
+      margin-bottom: 0;
+      font-size: 13px;
+      color: #1a1a1a;
+    }
+    .toggle {
+      position: relative;
+      width: 40px;
+      height: 22px;
+    }
+    .toggle input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .toggle .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background: #ccc;
+      border-radius: 22px;
+      transition: 0.2s;
+    }
+    .toggle .slider::before {
+      content: '';
+      position: absolute;
+      width: 16px;
+      height: 16px;
+      left: 3px;
+      bottom: 3px;
+      background: white;
+      border-radius: 50%;
+      transition: 0.2s;
+    }
+    .toggle input:checked + .slider {
+      background: #7c5cbf;
+    }
+    .toggle input:checked + .slider::before {
+      transform: translateX(18px);
+    }
+    .status {
+      font-size: 12px;
+      color: #888;
+      margin-top: 8px;
+    }
+    .shortcut {
+      margin-top: 12px;
+      padding: 8px;
+      background: #f5f3ff;
+      border-radius: 4px;
+      font-size: 12px;
+      color: #5b4a8a;
+    }
+    kbd {
+      display: inline-block;
+      padding: 1px 5px;
+      font-size: 11px;
+      font-family: inherit;
+      background: white;
+      border: 1px solid #d0c8e8;
+      border-radius: 3px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Highlighter TTS</h1>
+
+  <div class="field">
+    <label for="apiToken">ElevenLabs API Key</label>
+    <input type="password" id="apiToken" placeholder="sk_...">
+  </div>
+
+  <div class="field">
+    <label for="modelId">TTS Model</label>
+    <select id="modelId">
+      <option value="eleven_turbo_v2_5" selected>Turbo v2.5 (fastest)</option>
+      <option value="eleven_multilingual_v2">Multilingual v2</option>
+      <option value="eleven_monolingual_v1">Monolingual v1</option>
+    </select>
+  </div>
+
+  <div class="field">
+    <label for="defaultVoice">Default Voice</label>
+    <select id="defaultVoice"></select>
+    <div class="hint">The list is loaded from ElevenLabs when your API key allows it.</div>
+  </div>
+
+  <div class="field">
+    <label for="defaultSpeed">Default Speed</label>
+    <select id="defaultSpeed">
+      <option value="0.5">0.5x</option>
+      <option value="0.75">0.75x</option>
+      <option value="1" selected>1.0x</option>
+      <option value="1.25">1.25x</option>
+      <option value="1.5">1.5x</option>
+      <option value="2">2.0x</option>
+    </select>
+  </div>
+
+  <div class="toggle-row">
+    <label for="articleMode">Article Mode (filter ads/nav)</label>
+    <div class="toggle">
+      <input type="checkbox" id="articleMode" checked>
+      <span class="slider"></span>
+    </div>
+  </div>
+
+  <div class="status" id="status"></div>
+
+  <div class="shortcut">
+    Activate: right-click &rarr; "Toggle Highlight Mode"
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

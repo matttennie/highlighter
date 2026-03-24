@@ -1,0 +1,276 @@
+/* ── Highlight mode cursor ── */
+.highlighter-mode {
+  cursor: none !important;
+}
+.highlighter-mode * {
+  cursor: none !important;
+}
+
+.highlighter-cursor {
+  position: fixed;
+  pointer-events: none;
+  z-index: 2147483647;
+  border-radius: 50%;
+  background: rgba(180, 130, 255, 0.35);
+  border: 2px solid rgba(150, 100, 230, 0.5);
+  transform: translate(-50%, -50%);
+  display: none;
+}
+.highlighter-mode .highlighter-cursor {
+  display: block;
+}
+
+/* ── Paint stroke overlay ── */
+.highlighter-stroke-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 2147483646;
+}
+
+/* ── Mode indicator badge ── */
+.highlighter-indicator {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  padding: 5px 12px;
+  background: rgba(120, 80, 200, 0.88);
+  color: white;
+  font: 12px/1.4 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  border-radius: 20px;
+  z-index: 2147483647;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+.highlighter-indicator.visible {
+  opacity: 1;
+}
+
+/* ── Floating player ── */
+.hltr-player {
+  position: fixed;
+  z-index: 2147483645;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 10px;
+  background: rgba(24, 24, 28, 0.93);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-radius: 40px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35), 0 0 0 1px rgba(255,255,255,0.07);
+  user-select: none;
+  touch-action: none;
+  opacity: 0;
+  transform: scale(0.88) translateY(6px);
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  pointer-events: none;
+}
+.hltr-player.hltr-visible {
+  opacity: 1;
+  transform: scale(1) translateY(0);
+  pointer-events: auto;
+}
+.hltr-player.hltr-dragging {
+  transition: none;
+  cursor: grabbing;
+}
+
+.hltr-btn {
+  width: 34px;
+  height: 34px;
+  border: none;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.85);
+  cursor: pointer;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  flex-shrink: 0;
+  transition: background 0.12s, color 0.12s;
+}
+.hltr-btn:hover {
+  background: rgba(255, 255, 255, 0.12);
+  color: white;
+}
+.hltr-btn:active {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+.hltr-play-pause {
+  width: 42px;
+  height: 42px;
+  background: rgba(255, 255, 255, 0.13);
+  color: white;
+  margin: 0 2px;
+}
+.hltr-play-pause:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+
+.hltr-divider {
+  width: 1px;
+  height: 20px;
+  background: rgba(255, 255, 255, 0.12);
+  margin: 0 4px;
+  flex-shrink: 0;
+}
+
+/* ── Menu panel ── */
+.hltr-menu-panel {
+  position: fixed;
+  z-index: 2147483644;
+  background: rgba(24, 24, 28, 0.96);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-radius: 14px;
+  padding: 14px 16px;
+  min-width: 220px;
+  box-shadow: 0 6px 28px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255,255,255,0.08);
+  color: rgba(255, 255, 255, 0.9);
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  opacity: 0;
+  transform: scale(0.92) translateY(6px);
+  transition: opacity 0.15s ease, transform 0.15s ease;
+  pointer-events: none;
+}
+.hltr-menu-panel.hltr-visible {
+  opacity: 1;
+  transform: scale(1) translateY(0);
+  pointer-events: auto;
+}
+
+.hltr-menu-row {
+  margin-bottom: 12px;
+}
+.hltr-menu-row:last-child {
+  margin-bottom: 0;
+}
+.hltr-menu-label {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.45);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 6px;
+}
+
+.hltr-voice-select {
+  width: 100%;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 7px;
+  color: white;
+  padding: 5px 8px;
+  font: 13px -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  cursor: pointer;
+}
+.hltr-voice-select option,
+.hltr-voice-select optgroup {
+  background: #1e1e22;
+  color: white;
+}
+
+/* Speed detent row */
+.hltr-speed-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.hltr-speed-slider {
+  flex: 1;
+  -webkit-appearance: none;
+  appearance: none;
+  height: 3px;
+  background: rgba(255,255,255,0.2);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+.hltr-speed-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: white;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.4);
+}
+.hltr-speed-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(255,255,255,0.7);
+  width: 34px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+/* ── Loading spinner on play button ── */
+.hltr-play-pause.hltr-loading svg {
+  display: none !important;
+}
+.hltr-play-pause.hltr-loading::after {
+  content: '';
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(255,255,255,0.3);
+  border-top-color: white;
+  border-radius: 50%;
+  animation: hltr-spin 0.7s linear infinite;
+}
+@keyframes hltr-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ── Error state ── */
+.hltr-player.hltr-error .hltr-play-pause {
+  color: #ff6b6b;
+}
+.hltr-player.hltr-error .hltr-play-pause:hover {
+  background: rgba(255, 107, 107, 0.15);
+}
+
+.hltr-toast {
+  position: fixed;
+  z-index: 2147483647;
+  display: none;
+  padding: 10px 12px;
+  background: rgba(30, 30, 34, 0.96);
+  color: rgba(255, 255, 255, 0.92);
+  font: 12px/1.45 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  border-radius: 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  text-align: left;
+  pointer-events: none;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.38);
+}
+.hltr-toast.hltr-visible {
+  display: block;
+  animation: hltr-toast-in 0.15s ease;
+}
+.hltr-toast.hltr-error {
+  background: rgba(40, 0, 0, 0.94);
+  color: #ffb0b0;
+}
+@keyframes hltr-toast-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Subtle pulse on pause icon while playing ── */
+.hltr-play-pause .hltr-icon-pause {
+  animation: hltr-pulse 2s ease-in-out infinite;
+}
+@keyframes hltr-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.65; }
+}
