@@ -15,9 +15,11 @@ describe('popup.html', () => {
     }
   });
 
-  it('renders an empty voice select that is populated dynamically', () => {
+  it('renders ElevenLabs-specific hints', () => {
+    assert.match(popupHtml, /id="providerHint"/i);
+    assert.match(popupHtml, /ElevenLabs API Key/i);
+    assert.match(popupHtml, /dropdown shows API-returned ElevenLabs voices when available/i);
     assert.match(popupHtml, /<select id="defaultVoice"><\/select>/i);
-    assert.match(popupHtml, /The list is loaded from ElevenLabs when your API key allows it\./i);
   });
 });
 
@@ -34,7 +36,9 @@ describe('popup.js', () => {
 
   it('loads voice options dynamically from the background worker', () => {
     assert.match(popupJs, /chrome\.runtime\.sendMessage\(\{ type: 'voices-request' \}/);
-    assert.match(popupJs, /ensureVoiceOption\(data\.defaultVoice \|\| DEFAULT_VOICE_ID, 'Configured voice'\)/);
+    assert.match(popupJs, /function syncElevenLabsUi\(savedModelId, savedVoiceId\)/);
+    assert.match(popupJs, /function isSupportedModelId\(modelId\)/);
+    assert.match(popupJs, /function setDefaultVoice\(voiceId\)/);
   });
 });
 
@@ -45,6 +49,6 @@ describe('default voice ID consistency', () => {
     assert.ok(popupMatch, 'popup.js should define DEFAULT_VOICE_ID');
     assert.ok(bgMatch, 'background.js should define DEFAULT_VOICE_ID');
     assert.equal(popupMatch[1], bgMatch[1], 'DEFAULT_VOICE_ID must match across files');
-    assert.equal(popupMatch[1], '21m00Tcm4TlvDq8ikWAM', 'DEFAULT_VOICE_ID should be the Rachel voice');
+    assert.equal(popupMatch[1], 'JBFqnCBsd6RMkjVDRZzb', 'DEFAULT_VOICE_ID should match the working ElevenLabs voice');
   });
 });

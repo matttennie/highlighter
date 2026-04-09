@@ -12,12 +12,15 @@ function getErrorMessage(response) {
   if (!response) return 'No response from background';
   switch (response.error) {
     case 'no-token':          return 'Set ElevenLabs API key in extension settings';
+    case 'unsupported-provider': return response.detail || 'Use an ElevenLabs API key';
     case 'empty-text':        return 'Select some text before playing';
     case 'text-too-long':     return response.detail || 'Text exceeds maximum length';
     case 'auth-failed':       return response.detail
       ? `Authentication failed\n${truncateDetail(response.detail)}`
       : 'Invalid API key';
-    case 'billing-required':  return 'API error (402)\nCheck ElevenLabs billing/quota';
+    case 'billing-required':  return response.detail
+      ? `API error (402)\n${truncateDetail(response.detail)}`
+      : 'API error (402)\nCheck ElevenLabs billing/quota';
     case 'rate-limited':      return 'Rate limited — try again shortly';
     case 'timeout':           return 'Request timed out — try again';
     case 'api-error':         return response.detail
@@ -43,7 +46,11 @@ describe('getErrorMessage', () => {
   });
 
   it('maps no-token', () => {
-    assert.match(getErrorMessage({ error: 'no-token' }), /ElevenLabs/);
+    assert.match(getErrorMessage({ error: 'no-token' }), /ElevenLabs/i);
+  });
+
+  it('maps unsupported-provider', () => {
+    assert.match(getErrorMessage({ error: 'unsupported-provider' }), /ElevenLabs API key/i);
   });
 
   it('maps empty-text', () => {
@@ -74,6 +81,15 @@ describe('getErrorMessage', () => {
     const msg = getErrorMessage({ error: 'billing-required' });
     assert.match(msg, /402/);
     assert.match(msg, /billing/i);
+  });
+
+  it('includes upstream billing-required detail when available', () => {
+    const msg = getErrorMessage({
+      error: 'billing-required',
+      detail: 'Free users cannot use library voices via the API.',
+    });
+    assert.match(msg, /402/);
+    assert.match(msg, /library voices/i);
   });
 
   it('maps rate-limited', () => {
@@ -238,7 +254,7 @@ describe('Request ID staleness guard', () => {
 function normalizePlaybackRate(speed) {
   const parsed = parseFloat(speed);
   if (!Number.isFinite(parsed)) return 1.0;
-  return Math.max(0.5, Math.min(2.0, parsed));
+  return Math.max(0.7, Math.min(1.2, parsed));
 }
 
 describe('normalizePlaybackRate', () => {
@@ -250,23 +266,23 @@ describe('normalizePlaybackRate', () => {
     assert.equal(normalizePlaybackRate(Infinity), 1.0);
   });
 
-  it('clamps values below minimum to 0.5', () => {
-    assert.equal(normalizePlaybackRate(0.25), 0.5);
-    assert.equal(normalizePlaybackRate(0), 0.5);
-    assert.equal(normalizePlaybackRate(-1), 0.5);
+  it('clamps values below minimum to 0.7', () => {
+    assert.equal(normalizePlaybackRate(0.25), 0.7);
+    assert.equal(normalizePlaybackRate(0), 0.7);
+    assert.equal(normalizePlaybackRate(-1), 0.7);
   });
 
   it('preserves in-range values', () => {
-    assert.equal(normalizePlaybackRate('1.25'), 1.25);
-    assert.equal(normalizePlaybackRate(0.5), 0.5);
-    assert.equal(normalizePlaybackRate(2.0), 2.0);
+    assert.equal(normalizePlaybackRate('1.1'), 1.1);
+    assert.equal(normalizePlaybackRate(0.7), 0.7);
+    assert.equal(normalizePlaybackRate(1.2), 1.2);
     assert.equal(normalizePlaybackRate(1), 1.0);
   });
 
-  it('clamps values above maximum to 2.0', () => {
-    assert.equal(normalizePlaybackRate(3), 2.0);
-    assert.equal(normalizePlaybackRate(2.1), 2.0);
-    assert.equal(normalizePlaybackRate(100), 2.0);
+  it('clamps values above maximum to 1.2', () => {
+    assert.equal(normalizePlaybackRate(3), 1.2);
+    assert.equal(normalizePlaybackRate(2.1), 1.2);
+    assert.equal(normalizePlaybackRate(100), 1.2);
   });
 });
 

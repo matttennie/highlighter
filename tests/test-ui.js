@@ -23,4 +23,16 @@ describe('error presentation', () => {
     assert.match(contentJs, /chrome\.runtime\.sendMessage\(\{ type: 'voices-request' \}/);
     assert.match(contentJs, /ensureVoiceOption\(selectEl, selectedVoice \|\| cachedVoice, 'Configured voice'\)/);
   });
+
+  it('keeps the player open until explicitly closed and exposes player controls', () => {
+    assert.match(contentJs, /hltr-highlight-btn/);
+    assert.match(contentJs, /hltr-close-btn/);
+    assert.match(contentJs, /toggleHighlightMode\(\)/);
+    assert.doesNotMatch(contentJs, /if \(playerEl && playerEl\.classList\.contains\('hltr-visible'\)\) \{\s*sel\?\.removeAllRanges\(\);\s*hidePlayer\(\);\s*\}/);
+  });
+
+  it('styles the highlight button distinctly inside the player', () => {
+    assert.match(contentCss, /\.hltr-highlight-btn\s*\{/);
+    assert.match(contentCss, /\.hltr-close-btn\s*\{/);
+  });
 });

@@ -3,24 +3,52 @@ const modelSelect = document.getElementById('modelId');
 const voiceSelect = document.getElementById('defaultVoice');
 const speedSelect = document.getElementById('defaultSpeed');
 const articleToggle = document.getElementById('articleMode');
+const providerHint = document.getElementById('providerHint');
+const modelHint = document.getElementById('modelHint');
+const voiceHint = document.getElementById('voiceHint');
 const statusEl = document.getElementById('status');
-const DEFAULT_VOICE_ID = '21m00Tcm4TlvDq8ikWAM';
+const DEFAULT_VOICE_ID = 'JBFqnCBsd6RMkjVDRZzb';
+const DEFAULT_MODEL_ID = 'eleven_flash_v2_5';
+const MODEL_OPTIONS = [
+  { value: 'eleven_flash_v2_5', label: 'Flash v2.5 (recommended)' },
+  { value: 'eleven_turbo_v2_5', label: 'Turbo v2.5' },
+  { value: 'eleven_multilingual_v2', label: 'Multilingual v2' },
+];
 let statusTimer = 0;
 let tokenSaveTimer = 0;
 
+function isSupportedModelId(modelId) {
+  return MODEL_OPTIONS.some((model) => model.value === modelId);
+}
+
+function syncElevenLabsUi(savedModelId, savedVoiceId) {
+  providerHint.textContent = 'Enter an ElevenLabs key that starts with sk_.';
+  modelHint.textContent = 'Model options for ElevenLabs.';
+  voiceHint.textContent = 'The dropdown shows API-returned ElevenLabs voices when available; otherwise it falls back to the configured voice.';
+
+  const modelFragment = document.createDocumentFragment();
+  for (const model of MODEL_OPTIONS) {
+    const option = document.createElement('option');
+    option.value = model.value;
+    option.textContent = model.label;
+    modelFragment.appendChild(option);
+  }
+  modelSelect.replaceChildren(modelFragment);
+  const effectiveModelId = isSupportedModelId(savedModelId) ? savedModelId : DEFAULT_MODEL_ID;
+  modelSelect.value = effectiveModelId;
+  if (savedModelId && savedModelId !== effectiveModelId) {
+    chrome.storage.local.set({ modelId: effectiveModelId });
+  }
+  ensureVoiceOption(savedVoiceId || DEFAULT_VOICE_ID, 'Configured voice');
+}
+
 // Load saved settings
 chrome.storage.local.get(
-  ['elApiKey', 'modelId', 'defaultVoice', 'defaultSpeed', 'articleMode'],
+  ['apiKey', 'elApiKey', 'modelId', 'defaultVoice', 'defaultSpeed', 'articleMode'],
   (data) => {
-    if (data.elApiKey) tokenInput.value = data.elApiKey;
-    if (data.modelId) {
-      modelSelect.value = data.modelId;
-      if (!modelSelect.value) {
-        // Stale model — clear storage so default is used
-        chrome.storage.local.remove('modelId');
-      }
-    }
-    ensureVoiceOption(data.defaultVoice || DEFAULT_VOICE_ID, 'Configured voice');
+    const savedApiKey = data.apiKey || data.elApiKey || '';
+    if (savedApiKey) tokenInput.value = savedApiKey;
+    syncElevenLabsUi(data.modelId, data.defaultVoice);
     if (data.defaultSpeed) speedSelect.value = data.defaultSpeed;
     if (data.articleMode !== undefined) articleToggle.checked = data.articleMode;
     loadVoices(data.defaultVoice || DEFAULT_VOICE_ID);
@@ -40,6 +68,10 @@ function save(key, value) {
   chrome.storage.local.set({ [key]: value }, () => showStatus('Saved'));
 }
 
+function saveApiKey(value) {
+  chrome.storage.local.set({ apiKey: value, elApiKey: value }, () => showStatus('Saved'));
+}
+
 function ensureVoiceOption(voiceId, label) {
   if (!voiceId) return;
   const existing = Array.from(voiceSelect.options).find((option) => option.value === voiceId);
@@ -54,6 +86,10 @@ function ensureVoiceOption(voiceId, label) {
   option.textContent = label || voiceId;
   voiceSelect.appendChild(option);
   voiceSelect.value = voiceId;
+}
+
+function setDefaultVoice(voiceId) {
+  chrome.storage.local.set({ defaultVoice: voiceId }, () => showStatus('Saved'));
 }
 
 function loadVoices(selectedVoice) {
@@ -84,15 +120,24 @@ function loadVoices(selectedVoice) {
     }
 
     voiceSelect.replaceChildren(fragment);
-    voiceSelect.value = selectedVoice || DEFAULT_VOICE_ID;
-    if (!voiceSelect.value) ensureVoiceOption(selectedVoice || DEFAULT_VOICE_ID, 'Configured voice');
+    const effectiveVoiceId = Array.from(voiceSelect.options).some((option) => option.value === selectedVoice)
+      ? selectedVoice
+      : DEFAULT_VOICE_ID;
+    voiceSelect.value = effectiveVoiceId;
+    if (!voiceSelect.value) {
+      ensureVoiceOption(DEFAULT_VOICE_ID, 'Configured voice');
+      voiceSelect.value = DEFAULT_VOICE_ID;
+    }
+    if (effectiveVoiceId !== selectedVoice && effectiveVoiceId) {
+      setDefaultVoice(effectiveVoiceId);
+    }
   });
 }
 
 function saveTokenSoon() {
   clearTimeout(tokenSaveTimer);
   tokenSaveTimer = setTimeout(() => {
-    save('elApiKey', tokenInput.value.trim());
+    saveApiKey(tokenInput.value.trim());
     tokenSaveTimer = 0;
   }, 250);
 }
@@ -100,7 +145,7 @@ function saveTokenSoon() {
 tokenInput.addEventListener('input', saveTokenSoon);
 tokenInput.addEventListener('blur', () => {
   clearTimeout(tokenSaveTimer);
-  save('elApiKey', tokenInput.value.trim());
+  saveApiKey(tokenInput.value.trim());
   tokenSaveTimer = 0;
   loadVoices(voiceSelect.value || DEFAULT_VOICE_ID);
 });

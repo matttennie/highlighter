@@ -9,7 +9,7 @@ const backgroundJs = fs.readFileSync(path.join(rootDir, 'background.js'), 'utf8'
 function normalizeSpeed(speed) {
   const parsed = parseFloat(speed);
   if (!Number.isFinite(parsed)) return 1;
-  return Math.max(0.5, Math.min(2, parsed));
+  return Math.max(0.7, Math.min(1.2, parsed));
 }
 
 describe('background command handling', () => {
@@ -27,6 +27,11 @@ describe('background command handling', () => {
     assert.match(backgroundJs, /async function handleVoicesRequest\(\)/);
     assert.match(backgroundJs, /https:\/\/api\.elevenlabs\.io\/v1\/voices/);
   });
+
+  it('requires an ElevenLabs-style key prefix', () => {
+    assert.match(backgroundJs, /apiKey\.startsWith\('sk_'\)/);
+    assert.match(backgroundJs, /Use an ElevenLabs API key that starts with sk_\./);
+  });
 });
 
 describe('normalizeSpeed', () => {
@@ -39,9 +44,9 @@ describe('normalizeSpeed', () => {
   });
 
   it('clamps speeds to the supported range', () => {
-    assert.equal(normalizeSpeed(0.1), 0.5);
-    assert.equal(normalizeSpeed(1.5), 1.5);
-    assert.equal(normalizeSpeed(3), 2);
+    assert.equal(normalizeSpeed(0.1), 0.7);
+    assert.equal(normalizeSpeed(1.1), 1.1);
+    assert.equal(normalizeSpeed(3), 1.2);
   });
 });
 
@@ -63,6 +68,25 @@ describe('error response JSON parsing', () => {
   it('parses error responses as JSON', () => {
     assert.match(backgroundJs, /\.json\(\)/);
     assert.match(backgroundJs, /async function parseErrorDetail\(res\)/);
+  });
+});
+
+describe('ElevenLabs request path', () => {
+  it('posts text-to-speech requests to ElevenLabs', () => {
+    assert.match(backgroundJs, /https:\/\/api\.elevenlabs\.io\/v1\/text-to-speech/);
+    assert.match(backgroundJs, /'xi-api-key': apiKey/);
+  });
+
+  it('falls back to a supported model when storage contains a stale one', () => {
+    assert.match(backgroundJs, /const SUPPORTED_MODEL_IDS = new Set/);
+    assert.match(backgroundJs, /SUPPORTED_MODEL_IDS\.has\(data\.modelId\) \? data\.modelId : DEFAULT_MODEL_ID/);
+  });
+
+  it('filters voice results down to selectable voices', () => {
+    assert.match(backgroundJs, /function isSelectableVoice\(voice\)/);
+    assert.match(backgroundJs, /voice\.category === 'premade'/);
+    assert.match(backgroundJs, /voice\.is_owner/);
+    assert.match(backgroundJs, /payload\.voices\s*\.filter\(isSelectableVoice\)/s);
   });
 });
 

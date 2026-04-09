@@ -57,7 +57,7 @@
   display: flex;
   align-items: center;
   gap: 2px;
-  padding: 6px 10px;
+  padding: 6px 10px 6px 8px;
   background: rgba(24, 24, 28, 0.93);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
@@ -112,6 +112,26 @@
 }
 .hltr-play-pause:hover {
   background: rgba(255, 255, 255, 0.22);
+}
+
+.hltr-highlight-btn {
+  background: rgba(180, 130, 255, 0.2);
+  color: rgba(246, 238, 255, 0.98);
+}
+.hltr-highlight-btn:hover {
+  background: rgba(180, 130, 255, 0.34);
+  color: white;
+}
+
+.hltr-close-btn {
+  width: 26px;
+  height: 26px;
+  margin-left: 2px;
+  color: rgba(255, 255, 255, 0.62);
+}
+.hltr-close-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: rgba(255, 255, 255, 0.95);
 }
 
 .hltr-divider {

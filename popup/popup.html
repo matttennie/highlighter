@@ -115,32 +115,31 @@
   <div class="field">
     <label for="apiToken">ElevenLabs API Key</label>
     <input type="password" id="apiToken" placeholder="sk_...">
+    <div class="hint" id="providerHint">Enter an ElevenLabs key that starts with sk_.</div>
   </div>
 
   <div class="field">
     <label for="modelId">TTS Model</label>
     <select id="modelId">
-      <option value="eleven_turbo_v2_5" selected>Turbo v2.5 (fastest)</option>
-      <option value="eleven_multilingual_v2">Multilingual v2</option>
-      <option value="eleven_monolingual_v1">Monolingual v1</option>
     </select>
+    <div class="hint" id="modelHint">Model options for ElevenLabs.</div>
   </div>
 
   <div class="field">
     <label for="defaultVoice">Default Voice</label>
     <select id="defaultVoice"></select>
-    <div class="hint">The list is loaded from ElevenLabs when your API key allows it.</div>
+    <div class="hint" id="voiceHint">The dropdown shows API-returned ElevenLabs voices when available; otherwise it falls back to the configured voice.</div>
   </div>
 
   <div class="field">
     <label for="defaultSpeed">Default Speed</label>
     <select id="defaultSpeed">
-      <option value="0.5">0.5x</option>
+      <option value="0.7">0.7x</option>
       <option value="0.75">0.75x</option>
+      <option value="0.9">0.9x</option>
       <option value="1" selected>1.0x</option>
-      <option value="1.25">1.25x</option>
-      <option value="1.5">1.5x</option>
-      <option value="2">2.0x</option>
+      <option value="1.1">1.1x</option>
+      <option value="1.2">1.2x</option>
     </select>
   </div>
 

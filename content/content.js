@@ -3,9 +3,9 @@
 
   // ── Constants ──────────────────────────────────────────────────────
   const DEFAULT_VOICE_ID = '21m00Tcm4TlvDq8ikWAM'; // FIX 8: single constant
-  const CURSOR_SIZE      = 32;
+  const CURSOR_SIZE      = 22;
   const LINE_TOLERANCE   = 14;  // for END line detection (confirmed working)
-  const SPEEDS           = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+  const SPEEDS           = [0.7, 0.75, 0.9, 1.0, 1.1, 1.2];
   const TTS_TIMEOUT_MS   = 35000; // FIX 7: response timeout
 
   // ── State ──────────────────────────────────────────────────────────
@@ -429,6 +429,11 @@
     playerEl = document.createElement('div');
     playerEl.className = 'hltr-player';
     playerEl.innerHTML = `
+      <button class="hltr-btn hltr-highlight-btn" title="Toggle highlight mode">
+        <svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">
+          <path d="M15.2 3.2a2.5 2.5 0 0 1 3.54 0l2.06 2.06a2.5 2.5 0 0 1 0 3.54l-8.95 8.95-4.66 1.12 1.12-4.66zM6.5 19.5h11v2h-11z"/>
+        </svg>
+      </button>
       <button class="hltr-btn hltr-skip-back" title="Previous sentence">
         <svg viewBox="0 0 24 24" width="17" height="17" fill="currentColor">
           <path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/>
@@ -453,6 +458,11 @@
           <circle cx="5" cy="12" r="1.8"/>
           <circle cx="12" cy="12" r="1.8"/>
           <circle cx="19" cy="12" r="1.8"/>
+        </svg>
+      </button>
+      <button class="hltr-btn hltr-close-btn" title="Close player">
+        <svg viewBox="0 0 24 24" width="15" height="15" fill="currentColor" aria-hidden="true">
+          <path d="M18.3 5.71 12 12l6.3 6.29-1.41 1.41L10.59 13.4 4.29 19.7 2.88 18.29 9.17 12 2.88 5.71 4.29 4.29l6.3 6.3 6.29-6.3z"/>
         </svg>
       </button>
     `;
@@ -500,6 +510,10 @@
       e.stopPropagation();
       navigateSentence(-1);
     });
+    playerEl.querySelector('.hltr-highlight-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleHighlightMode();
+    });
     playerEl.querySelector('.hltr-play-pause').addEventListener('click', (e) => {
       e.stopPropagation();
       onPlayPause();
@@ -511,6 +525,11 @@
     playerEl.querySelector('.hltr-menu-btn').addEventListener('click', (e) => {
       e.stopPropagation();
       toggleMenu();
+    });
+    playerEl.querySelector('.hltr-close-btn').addEventListener('click', (e) => {
+      e.stopPropagation();
+      window.getSelection()?.removeAllRanges();
+      hidePlayer();
     });
 
     // Speed slider
@@ -921,11 +940,14 @@
     if (!response) return 'No response from background';
     switch (response.error) {
       case 'no-token':          return 'Set ElevenLabs API key in extension settings';
+      case 'unsupported-provider': return response.detail || 'Use an ElevenLabs API key';
       case 'empty-text':        return 'Select some text before playing';
       case 'auth-failed':       return response.detail
         ? `Authentication failed\n${truncateDetail(response.detail)}`
         : 'Invalid API key';
-      case 'billing-required':  return 'API error (402)\nCheck ElevenLabs billing/quota';
+      case 'billing-required':  return response.detail
+        ? `API error (402)\n${truncateDetail(response.detail)}`
+        : 'API error (402)\nCheck ElevenLabs billing/quota';
       case 'rate-limited':      return 'Rate limited — try again shortly';
       case 'text-too-long':     return response.detail
         ? `Text too long\n${truncateDetail(response.detail)}`
@@ -941,7 +963,7 @@
   function normalizePlaybackRate(speed) {
     const parsed = parseFloat(speed);
     if (!Number.isFinite(parsed)) return 1.0;
-    return Math.max(0.5, Math.min(2.0, parsed));
+    return Math.max(0.7, Math.min(1.2, parsed));
   }
 
   function ensureVoiceOption(selectEl, voiceId, label) {
@@ -1110,12 +1132,6 @@
     if (menuPanelEl && menuPanelEl.contains(e.target)) return;
 
     if (!highlightMode) {
-      // Clicking outside selection while player is visible clears everything
-      const sel = window.getSelection();
-      if (playerEl && playerEl.classList.contains('hltr-visible')) {
-        sel?.removeAllRanges();
-        hidePlayer();
-      }
       return;
     }
     e.preventDefault();
@@ -1126,8 +1142,6 @@
   function onKeyDown(e) {
     if (e.key === 'Escape') {
       if (highlightMode) exitHighlightMode();
-      window.getSelection()?.removeAllRanges();
-      hidePlayer();
     }
   }
 
