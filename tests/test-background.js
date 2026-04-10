@@ -19,7 +19,8 @@ describe('background command handling', () => {
   });
 
   it('guards against undefined tab ids before sending messages', () => {
-    assert.match(backgroundJs, /if \(!Number\.isInteger\(tabId\)\) return;/);
+    assert.match(backgroundJs, /if \(!Number\.isInteger\(tabId\)\) \{/);
+    assert.match(backgroundJs, /error: 'tab-not-found'/);
   });
 
   it('handles dynamic voice-list requests', () => {

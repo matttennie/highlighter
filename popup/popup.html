@@ -90,6 +90,39 @@
       color: #888;
       margin-top: 8px;
     }
+    .debug-actions {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .debug-actions button {
+      flex: 1;
+      border: 1px solid #d0c8e8;
+      border-radius: 4px;
+      background: #fff;
+      color: #5b4a8a;
+      cursor: pointer;
+      font: inherit;
+      font-size: 11px;
+      padding: 5px 6px;
+    }
+    .debug-actions button:hover {
+      background: #f5f3ff;
+    }
+    .debug-preview {
+      display: none;
+      margin-top: 8px;
+      max-height: 120px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      border: 1px solid #eee;
+      border-radius: 4px;
+      background: #fafafa;
+      color: #555;
+      font: 10px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+      padding: 6px;
+    }
     .shortcut {
       margin-top: 12px;
       padding: 8px;
@@ -152,6 +185,12 @@
   </div>
 
   <div class="status" id="status"></div>
+
+  <div class="debug-actions">
+    <button type="button" id="copyDebugLog">Copy Debug Log</button>
+    <button type="button" id="clearDebugLog">Clear Log</button>
+  </div>
+  <pre class="debug-preview" id="debugPreview"></pre>
 
   <div class="shortcut">
     Activate: right-click &rarr; "Toggle Highlight Mode"

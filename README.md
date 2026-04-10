@@ -4,11 +4,19 @@
 
 ## Features
 
-- Highlight mode with a brush-style cursor
-- Floating playback transport with skip, play/pause, settings, close, and highlight toggle
-- ElevenLabs text-to-speech integration
-- Voice filtering so the popup only shows selectable voices
-- Speed controls matched to the supported ElevenLabs range
+- **Highlight Mode:** Brush-style cursor for intuitive text selection.
+- **Floating Transport:** Play, pause, skip, and adjust settings from a draggable in-page player.
+- **TTS Integration:** High-quality speech via ElevenLabs (v2.5 Flash/Turbo).
+- **Voice Management:** Dynamic voice filtering and selection.
+- **Robustness:** Built-in fallbacks to browser `speechSynthesis` when API limits are hit or CSP blocks external audio.
+
+## Stability & Robustness
+
+This extension is built for production-grade reliability:
+- **Stale Request Guard:** Prevents overlapping audio by invalidating old TTS requests during rapid skipping.
+- **Injection Filtering:** Automatically skips injection on restricted URLs (e.g., `chrome://`, Chrome Web Store) to prevent console noise and permission errors.
+- **Resource Management:** Explicit `Audio` object cleanup and event listener nulling to prevent memory leaks in long sessions.
+- **Extension Invalidation Handling:** Gracefully handles script communication failures when the extension is updated or reloaded.
 
 ## Setup
 

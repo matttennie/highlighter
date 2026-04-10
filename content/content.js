@@ -1,12 +1,17 @@
 (() => {
   'use strict';
+  if (window.__highlighterTtsContentLoaded) return;
+  window.__highlighterTtsContentLoaded = true;
 
   // ── Constants ──────────────────────────────────────────────────────
-  const DEFAULT_VOICE_ID = '21m00Tcm4TlvDq8ikWAM'; // FIX 8: single constant
+  const DEFAULT_VOICE_ID = 'JBFqnCBsd6RMkjVDRZzb';
   const CURSOR_SIZE      = 22;
   const LINE_TOLERANCE   = 14;  // for END line detection (confirmed working)
   const SPEEDS           = [0.7, 0.75, 0.9, 1.0, 1.1, 1.2];
   const TTS_TIMEOUT_MS   = 35000; // FIX 7: response timeout
+  const AUDIO_START_TIMEOUT_MS = 8000;
+  const BASE64_CHUNK_SIZE = 8192;
+  const LOG_PREFIX       = '[Highlighter TTS]';
 
   // ── State ──────────────────────────────────────────────────────────
   let highlightMode = false;
@@ -26,24 +31,89 @@
 
   // ── Audio playback state ──────────────────────────────────────────
   let pbAudio       = null;   // current Audio element
+  let pbAudioObjectUrl = null;
   let pbState       = 'idle'; // 'idle' | 'loading' | 'playing' | 'paused' | 'error'
   let pbRequestId   = 0;      // monotonic counter to discard stale TTS responses
   let cachedVoice   = DEFAULT_VOICE_ID; // FIX 8: use constant
   let cachedSpeed   = 1.0;
 
+  function logDebug(event, details = {}) {
+    const payload = {
+      page: location.href,
+      state: pbState,
+      requestId: pbRequestId,
+      ...details,
+    };
+    console.log(`${LOG_PREFIX} ${event}`, payload);
+    persistDebugEvent('content', event, payload);
+  }
+
+  function persistDebugEvent(source, event, details = {}) {
+    if (!chrome?.runtime?.sendMessage) return;
+    try {
+      chrome.runtime.sendMessage(
+        {
+          type: 'debug-event',
+          entry: {
+            ts: new Date().toISOString(),
+            source,
+            event,
+            details,
+          },
+        },
+        () => {
+          // Suppress "receiving end does not exist" noise if the worker is asleep/reloading.
+          void chrome.runtime.lastError;
+        }
+      );
+    } catch (e) {
+      // Extension context invalidated — silent fail to avoid console noise
+    }
+  }
+
   // ── Load settings and listen for changes ──────────────────────────
   chrome.storage.local.get(
     ['articleMode', 'defaultVoice', 'defaultSpeed'],
     (data) => {
+      const storageError = chrome.runtime.lastError?.message || null;
+      if (storageError) {
+        logDebug('settings-load-failed', { error: storageError });
+        return;
+      }
       if (data.articleMode !== undefined) articleModeEnabled = data.articleMode;
       if (data.defaultVoice) cachedVoice = data.defaultVoice;
       if (data.defaultSpeed) cachedSpeed = parseFloat(data.defaultSpeed) || 1.0;
+      logDebug('settings-loaded', {
+        articleModeEnabled,
+        cachedVoice,
+        cachedSpeed,
+      });
     }
   );
   chrome.storage.onChanged.addListener((changes) => {
-    if (changes.articleMode)   articleModeEnabled = changes.articleMode.newValue;
-    if (changes.defaultVoice)  cachedVoice = changes.defaultVoice.newValue;
-    if (changes.defaultSpeed)  cachedSpeed = parseFloat(changes.defaultSpeed.newValue) || 1.0;
+    const relevantChangedKeys = [];
+
+    if (changes.articleMode) {
+      articleModeEnabled = changes.articleMode.newValue;
+      relevantChangedKeys.push('articleMode');
+    }
+    if (changes.defaultVoice) {
+      cachedVoice = changes.defaultVoice.newValue;
+      relevantChangedKeys.push('defaultVoice');
+    }
+    if (changes.defaultSpeed) {
+      cachedSpeed = parseFloat(changes.defaultSpeed.newValue) || 1.0;
+      relevantChangedKeys.push('defaultSpeed');
+    }
+
+    if (!relevantChangedKeys.length) return;
+
+    logDebug('settings-changed', {
+      changedKeys: relevantChangedKeys,
+      cachedVoice,
+      cachedSpeed,
+      articleModeEnabled,
+    });
   });
 
   // ── DOM elements (lazily created) ──────────────────────────────────
@@ -97,6 +167,7 @@
     highlightMode = true;
     document.documentElement.classList.add('highlighter-mode');
     indicatorEl.classList.add('visible');
+    logDebug('highlight-mode-entered');
   }
 
   function exitHighlightMode() {
@@ -107,6 +178,7 @@
     document.documentElement.classList.remove('highlighter-mode');
     if (indicatorEl) indicatorEl.classList.remove('visible');
     clearStroke();
+    logDebug('highlight-mode-exited');
   }
 
   function toggleHighlightMode() {
@@ -488,6 +560,11 @@
 
     // Load saved settings into menu controls
     chrome.storage.local.get(['defaultVoice', 'defaultSpeed'], (data) => {
+      const storageError = chrome.runtime.lastError?.message || null;
+      if (storageError) {
+        logDebug('player-settings-load-failed', { error: storageError });
+        return;
+      }
       const voiceSelect = menuPanelEl.querySelector('.hltr-voice-select');
       ensureVoiceOption(voiceSelect, data.defaultVoice || cachedVoice, 'Configured voice');
       loadVoiceOptions(voiceSelect, data.defaultVoice || cachedVoice);
@@ -539,13 +616,19 @@
       const speed = SPEEDS[parseInt(slider.value)];
       cachedSpeed = speed;
       speedLbl.textContent = speed + 'x';
-      chrome.storage.local.set({ defaultSpeed: speed.toString() });
+      chrome.storage.local.set({ defaultSpeed: speed.toString() }, () => {
+        const storageError = chrome.runtime.lastError?.message || null;
+        if (storageError) logDebug('speed-save-failed', { error: storageError });
+      });
     });
 
     // Voice select
     menuPanelEl.querySelector('.hltr-voice-select').addEventListener('change', (e) => {
       cachedVoice = e.target.value;
-      chrome.storage.local.set({ defaultVoice: e.target.value });
+      chrome.storage.local.set({ defaultVoice: e.target.value }, () => {
+        const storageError = chrome.runtime.lastError?.message || null;
+        if (storageError) logDebug('voice-save-failed', { error: storageError });
+      });
     });
 
     // Drag
@@ -566,6 +649,11 @@
     if (!playerEl) return;
     // Restore saved position, or default to top-right (near the indicator badge)
     chrome.storage.local.get('playerPos', (data) => {
+      const storageError = chrome.runtime.lastError?.message || null;
+      if (storageError) {
+        logDebug('player-position-load-failed', { error: storageError });
+        data = {};
+      }
       const pw = playerEl.offsetWidth  || 200;
       const ph = playerEl.offsetHeight || 54;
       const vw = window.innerWidth;
@@ -586,11 +674,17 @@
       playerEl.style.left = left + 'px';
       playerEl.style.top  = top  + 'px';
       playerEl.classList.add('hltr-visible');
+      logDebug('player-shown', {
+        left,
+        top,
+        sentenceCount: pbSentences.length,
+      });
     });
   }
 
   function hidePlayer() {
     if (!playerEl) return;
+    logDebug('player-hidden');
     stopPlayback();
     playerEl.classList.remove('hltr-visible');
     closeMenu();
@@ -668,6 +762,9 @@
         left: parseInt(playerEl.style.left, 10),
         top:  parseInt(playerEl.style.top,  10),
       }
+    }, () => {
+      const storageError = chrome.runtime.lastError?.message || null;
+      if (storageError) logDebug('player-position-save-failed', { error: storageError });
     });
   }
 
@@ -697,7 +794,9 @@
 
   // ── Audio playback ────────────────────────────────────────────────
   function setPlaybackState(state) {
+    const prevState = pbState;
     pbState = state;
+    logDebug('playback-state', { from: prevState, to: state });
     if (!playerEl) return;
 
     const playIcon  = playerEl.querySelector('.hltr-icon-play');
@@ -758,16 +857,12 @@
   }
 
   function playSentence(idx) {
+    const startedAt = performance.now();
     // FIX 2: Cancel any active speechSynthesis before starting a new sentence
     if (window.speechSynthesis) window.speechSynthesis.cancel();
 
     // FIX 3: Stop any current audio and properly release resources
-    if (pbAudio) {
-      pbAudio.pause();
-      pbAudio.removeAttribute('src');
-      pbAudio.load(); // releases the network/decode resource
-      pbAudio = null;
-    }
+    releaseCurrentAudioElement();
 
     if (idx < 0 || idx >= pbSentences.length) {
       setPlaybackState('idle');
@@ -791,11 +886,21 @@
       ? (SPEEDS[parseInt(speedSlider.value)] || cachedSpeed)
       : cachedSpeed;
     const text = pbSentences[idx].text;
+    logDebug('tts-request-start', {
+      idx,
+      voice,
+      speed,
+      textLength: text.length,
+    });
 
     // FIX 7: Set a timeout so we don't hang in 'loading' forever if the
     // background worker dies or the network request stalls.
     const responseTimeout = setTimeout(() => {
       if (requestId !== pbRequestId) return;
+      logDebug('tts-request-timeout', {
+        idx,
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
       showPlayerWarning('Request timed out');
       fallbackSpeechSynthesis(text, speed, requestId);
     }, TTS_TIMEOUT_MS);
@@ -809,6 +914,15 @@
         // Discard stale responses (user skipped or cancelled)
         if (requestId !== pbRequestId) return;
 
+        logDebug('tts-response', {
+          idx,
+          ok: Boolean(response?.ok),
+          error: response?.error || null,
+          status: response?.status || null,
+          elapsedMs: Math.round(performance.now() - startedAt),
+          runtimeError: chrome.runtime.lastError?.message || null,
+        });
+
         if (chrome.runtime.lastError || !response || !response.ok) {
           console.error('[Highlighter TTS] Response failure:', {
             runtimeError: chrome.runtime.lastError?.message || null,
@@ -817,7 +931,7 @@
           const errMsg = chrome.runtime.lastError
             ? 'Extension error: ' + chrome.runtime.lastError.message
             : getErrorMessage(response);
-          console.warn('[Highlighter TTS]', errMsg, '— falling back to speechSynthesis');
+          console.warn(LOG_PREFIX, errMsg, '— falling back to speechSynthesis');
           showPlayerWarning(errMsg);
           fallbackSpeechSynthesis(text, speed, requestId);
           return;
@@ -857,35 +971,117 @@
     // FIX 1: Capture requestId in closure so the ended handler can check staleness
     const capturedId = requestId;
     const playbackRate = normalizePlaybackRate(speed);
-    pbAudio = new Audio(dataUrl);
+    const audioUrl = audioDataUrlToObjectUrl(dataUrl) || dataUrl;
+    pbAudioObjectUrl = audioUrl.startsWith('blob:') ? audioUrl : null;
+    pbAudio = new Audio(audioUrl);
     pbAudio.playbackRate = playbackRate;
+
+    let started = false;
+    let usingFallback = false;
+    const audioStartTimeout = setTimeout(() => {
+      if (capturedId !== pbRequestId || started || usingFallback) return;
+      usingFallback = true;
+      logDebug('audio-start-timeout', {
+        requestId: capturedId,
+        readyState: pbAudio?.readyState ?? null,
+      });
+      releaseCurrentAudioElement();
+      fallbackSpeechSynthesis(text, speed, capturedId);
+    }, AUDIO_START_TIMEOUT_MS);
+
+    pbAudio.addEventListener('loadedmetadata', () => {
+      if (capturedId !== pbRequestId || usingFallback || !pbAudio) return;
+      logDebug('audio-loadedmetadata', {
+        requestId: capturedId,
+        duration: Number.isFinite(pbAudio.duration) ? Math.round(pbAudio.duration * 1000) / 1000 : null,
+        readyState: pbAudio.readyState,
+      });
+    });
+
+    pbAudio.addEventListener('canplay', () => {
+      if (capturedId !== pbRequestId || usingFallback || !pbAudio) return;
+      logDebug('audio-canplay', { requestId: capturedId, readyState: pbAudio.readyState });
+    });
+
+    pbAudio.addEventListener('playing', () => {
+      if (capturedId !== pbRequestId || usingFallback) return;
+      started = true;
+      clearTimeout(audioStartTimeout);
+      logDebug('audio-playing', { requestId: capturedId });
+      setPlaybackState('playing');
+    }, { once: true });
 
     // FIX 1: Stale-request guard on ended event prevents double-advance on skip
     pbAudio.addEventListener('ended', () => {
-      if (capturedId !== pbRequestId) return;
+      if (capturedId !== pbRequestId || usingFallback) return;
+      clearTimeout(audioStartTimeout);
+      logDebug('audio-ended', { requestId: capturedId });
+      releaseAudioObjectUrl();
       onAudioEnded();
-    });
+    }, { once: true });
 
     // FIX 5: Fall back to speechSynthesis on Audio error (CSP pages)
     // On strict-CSP pages, data: URI audio fails. Instead of just showing
     // an error, fall back to the browser's built-in speech synthesis.
     pbAudio.addEventListener('error', () => {
-      if (capturedId !== pbRequestId) return;
-      console.warn('[Highlighter TTS] Audio element error — falling back to speechSynthesis');
+      if (capturedId !== pbRequestId || usingFallback) return;
+      usingFallback = true;
+      clearTimeout(audioStartTimeout);
+      logDebug('audio-error', {
+        requestId: capturedId,
+        code: pbAudio?.error?.code || null,
+        message: pbAudio?.error?.message || null,
+        readyState: pbAudio?.readyState ?? null,
+      });
+      console.warn(`${LOG_PREFIX} Audio element error — falling back to speechSynthesis`);
+      releaseCurrentAudioElement();
       fallbackSpeechSynthesis(text, speed, capturedId);
-    });
+    }, { once: true });
 
     pbAudio.play()
       .then(() => {
-        if (capturedId !== pbRequestId) return;
-        setPlaybackState('playing');
+        if (capturedId !== pbRequestId || usingFallback || !pbAudio) return;
+        started = true;
+        clearTimeout(audioStartTimeout);
+        logDebug('audio-play-resolved', { requestId: capturedId });
+        if (pbState === 'loading') setPlaybackState('playing');
       })
       .catch((err) => {
-        if (capturedId !== pbRequestId) return;
+        if (capturedId !== pbRequestId || usingFallback) return;
+        usingFallback = true;
+        clearTimeout(audioStartTimeout);
+        logDebug('audio-play-rejected', {
+          requestId: capturedId,
+          message: err?.message || String(err),
+          name: err?.name || null,
+        });
         // FIX 5: Also fall back on play() promise rejection (another CSP vector)
-        console.warn('[Highlighter TTS] Audio play() rejected — falling back to speechSynthesis:', err.message);
+        console.warn(`${LOG_PREFIX} Audio play() rejected — falling back to speechSynthesis:`, err.message);
+        releaseCurrentAudioElement();
         fallbackSpeechSynthesis(text, speed, capturedId);
       });
+  }
+
+  function audioDataUrlToObjectUrl(dataUrl) {
+    const match = /^data:([^;,]+);base64,(.*)$/s.exec(dataUrl || '');
+    if (!match) return null;
+
+    try {
+      const mimeType = match[1];
+      const base64 = match[2];
+      const binary = atob(base64);
+      const chunks = [];
+      for (let i = 0; i < binary.length; i += BASE64_CHUNK_SIZE) {
+        const slice = binary.slice(i, i + BASE64_CHUNK_SIZE);
+        const bytes = new Uint8Array(slice.length);
+        for (let j = 0; j < slice.length; j++) bytes[j] = slice.charCodeAt(j);
+        chunks.push(bytes);
+      }
+      return URL.createObjectURL(new Blob(chunks, { type: mimeType }));
+    } catch (err) {
+      logDebug('audio-blob-url-failed', { message: err?.message || String(err) });
+      return null;
+    }
   }
 
   function fallbackSpeechSynthesis(text, speed, requestId) {
@@ -908,23 +1104,41 @@
     };
     utter.onstart = () => {
       if (requestId !== pbRequestId) return;
+      logDebug('speech-synthesis-started', { requestId });
       setPlaybackState('playing');
     };
     window.speechSynthesis.speak(utter);
   }
 
   function stopPlayback() {
+    logDebug('playback-stop');
     pbRequestId++; // invalidate in-flight requests
     // FIX 3: Properly release audio resources
-    if (pbAudio) {
-      pbAudio.pause();
-      pbAudio.removeAttribute('src');
-      pbAudio.load(); // releases the network/decode resource
-      pbAudio = null;
-    }
+    releaseCurrentAudioElement();
     // FIX 2: Also cancel speechSynthesis when stopping
     if (window.speechSynthesis) window.speechSynthesis.cancel();
     setPlaybackState('idle');
+  }
+
+  function releaseAudioObjectUrl() {
+    if (!pbAudioObjectUrl) return;
+    URL.revokeObjectURL(pbAudioObjectUrl);
+    pbAudioObjectUrl = null;
+  }
+
+  function releaseCurrentAudioElement() {
+    if (pbAudio) {
+      pbAudio.pause();
+      pbAudio.onended = null;
+      pbAudio.onerror = null;
+      pbAudio.onplaying = null;
+      pbAudio.oncanplay = null;
+      pbAudio.onloadstart = null;
+      pbAudio.removeAttribute('src');
+      pbAudio.load();
+      pbAudio = null;
+    }
+    releaseAudioObjectUrl();
   }
 
   function onAudioEnded() {
@@ -984,7 +1198,17 @@
 
   function loadVoiceOptions(selectEl, selectedVoice) {
     if (!selectEl) return;
+    const startedAt = performance.now();
+    logDebug('voices-request-start', { selectedVoice });
     chrome.runtime.sendMessage({ type: 'voices-request' }, (response) => {
+      logDebug('voices-response', {
+        ok: Boolean(response?.ok),
+        error: response?.error || null,
+        status: response?.status || null,
+        voiceCount: response?.voices?.length || 0,
+        elapsedMs: Math.round(performance.now() - startedAt),
+        runtimeError: chrome.runtime.lastError?.message || null,
+      });
       if (chrome.runtime.lastError || !response || !response.ok || !response.voices?.length) {
         ensureVoiceOption(selectEl, selectedVoice || cachedVoice, 'Configured voice');
         return;
@@ -1024,7 +1248,7 @@
 
   function showPlayerError(msg) {
     setPlaybackState('error');
-    console.warn('[Highlighter TTS]', msg);
+    console.warn(LOG_PREFIX, msg);
     showToast(msg, true);
     setTimeout(() => {
       if (pbState === 'error') setPlaybackState('idle');
@@ -1153,7 +1377,10 @@
   document.addEventListener('keydown',   onKeyDown,      true);
 
   // ── Message listener ───────────────────────────────────────────────
-  chrome.runtime.onMessage.addListener((msg) => {
-    if (msg.action === 'toggleHighlightMode') toggleHighlightMode();
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (msg.action === 'toggleHighlightMode') {
+      toggleHighlightMode();
+      sendResponse({ ok: true, highlightMode });
+    }
   });
 })();

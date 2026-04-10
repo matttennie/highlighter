@@ -1,75 +1,113 @@
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { chromium } from 'playwright';
+import process from 'node:process';
+import {
+  launchExtension,
+  sendRuntimeMessage,
+  startTestServer,
+  stamp,
+  toggleActiveTabFromServiceWorker,
+} from './extension-harness.mjs';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const rootDir = path.resolve(__dirname, '..');
-const userDataDir = '/tmp/highlighter-playwright-profile';
 const apiKey = process.env.ELEVENLABS_API_KEY;
+const startedAt = Date.now();
 
 if (!apiKey) {
   console.error('ELEVENLABS_API_KEY is required');
   process.exit(1);
 }
 
-const context = await chromium.launchPersistentContext(userDataDir, {
-  headless: false,
-  args: [
-    `--disable-extensions-except=${rootDir}`,
-    `--load-extension=${rootDir}`,
-  ],
-});
+const server = await startTestServer();
+const extension = await launchExtension({ apiKey, startedAt });
 
 try {
-  let [serviceWorker] = context.serviceWorkers();
-  if (!serviceWorker) {
-    serviceWorker = await context.waitForEvent('serviceworker', { timeout: 30000 });
-  }
-
-  const extensionId = new URL(serviceWorker.url()).host;
-  const popupPage = await context.newPage();
-  await popupPage.goto(`chrome-extension://${extensionId}/popup/popup.html`);
-
-  await popupPage.evaluate(
-    async ({ key }) => {
-      await chrome.storage.local.set({
-        apiKey: key,
-        elApiKey: key,
-        modelId: 'eleven_turbo_v2_5',
-        defaultVoice: 'JBFqnCBsd6RMkjVDRZzb',
-      });
-    },
-    { key: apiKey }
+  await extension.popupPage.waitForFunction(
+    () => document.querySelectorAll('#defaultVoice option').length > 1,
+    { timeout: 10000 }
   );
 
-  await popupPage.reload();
-  await popupPage.waitForTimeout(1500);
-
-  const voiceOptions = await popupPage.locator('#defaultVoice option').evaluateAll((options) =>
+  const voiceOptions = await extension.popupPage.locator('#defaultVoice option').evaluateAll((options) =>
     options.map((option) => ({
       value: option.value,
       text: option.textContent,
     }))
   );
 
-  const voicesResponse = await popupPage.evaluate(async () => {
-    return chrome.runtime.sendMessage({ type: 'voices-request' });
+  const voicesResponse = await sendRuntimeMessage(extension.popupPage, { type: 'voices-request' });
+  const ttsResponse = await sendRuntimeMessage(extension.popupPage, {
+    type: 'tts-request',
+    text: 'test',
+    voice: 'JBFqnCBsd6RMkjVDRZzb',
+    speed: 1,
   });
+  if (!voicesResponse?.ok || !voicesResponse.voices?.length) {
+    throw new Error(`voices request failed: ${JSON.stringify(voicesResponse)}`);
+  }
+  if (!ttsResponse?.ok || !ttsResponse.audioDataUrl) {
+    throw new Error(`tts request failed: ${JSON.stringify(ttsResponse)}`);
+  }
+  await extension.popupPage.close();
 
-  const ttsResponse = await popupPage.evaluate(async () => {
-    return chrome.runtime.sendMessage({
-      type: 'tts-request',
-      text: 'test',
-      voice: 'JBFqnCBsd6RMkjVDRZzb',
-      speed: 1,
-    });
-  });
+  const testPage = await extension.context.newPage();
+  await testPage.goto(server.url);
+  await testPage.waitForSelector('#short');
+  await testPage.reload();
+  await testPage.waitForSelector('#short');
+  await testPage.bringToFront();
+
+  await extension.serviceWorker.evaluate(
+    () =>
+      new Promise((resolve) => {
+        chrome.storage.local.set({ debugLog: [] }, resolve);
+      })
+  );
+  await extension.serviceWorker.evaluate(
+    () =>
+      new Promise((resolve) => {
+        chrome.storage.local.set(
+          {
+            debugLog: [
+              {
+                ts: new Date().toISOString(),
+                source: 'test',
+                event: 'debug-log-loop-probe',
+                details: {},
+              },
+            ],
+          },
+          resolve
+        );
+      })
+  );
+  await testPage.waitForTimeout(250);
+  const debugLoopProbe = await extension.serviceWorker.evaluate(
+    () =>
+      new Promise((resolve) => {
+        chrome.storage.local.get(['debugLog'], (data) => {
+          const debugLog = Array.isArray(data.debugLog) ? data.debugLog : [];
+          resolve({
+            logCount: debugLog.length,
+            settingsChangedCount: debugLog.filter((entry) => entry.event === 'settings-changed').length,
+          });
+        });
+      })
+  );
+  if (debugLoopProbe.settingsChangedCount !== 0) {
+    throw new Error(`debugLog storage write triggered settings-changed: ${JSON.stringify(debugLoopProbe)}`);
+  }
+
+  const toggleResponse = await toggleActiveTabFromServiceWorker(extension.serviceWorker, testPage.url());
+  if (!toggleResponse.ok) {
+    throw new Error(`toggle failed: ${JSON.stringify(toggleResponse)}`);
+  }
+  await testPage.locator('.highlighter-indicator.visible').waitFor({ timeout: 5000 });
 
   console.log(
     JSON.stringify(
       {
-        extensionId,
+        elapsed: stamp(startedAt),
+        extensionId: extension.extensionId,
+        testPageUrl: server.url,
+        toggleResponse,
+        debugLoopProbe,
         voiceOptions,
         voicesResponse,
         ttsResponse: {
@@ -85,5 +123,6 @@ try {
     )
   );
 } finally {
-  await context.close();
+  await extension.close();
+  await server.close();
 }

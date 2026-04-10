@@ -5,7 +5,11 @@
   "type": "module",
   "description": "Chrome extension: select text with a paint-brush stroke and hear it read aloud via ElevenLabs TTS",
   "scripts": {
-    "test": "node --test tests/*.js"
+    "test": "node --test tests/*.js",
+    "test:extension:verbose": "node tests/playwright-extension-check.mjs",
+    "test:extension:playback": "node tests/playwright-playback-flow.mjs",
+    "test:extension:real": "node tests/playwright-real-article-flow.mjs",
+    "watch:extension": "node tests/watch-extension.mjs"
   },
   "devDependencies": {
     "playwright": "^1.59.1"

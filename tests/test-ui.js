@@ -35,4 +35,10 @@ describe('error presentation', () => {
     assert.match(contentCss, /\.hltr-highlight-btn\s*\{/);
     assert.match(contentCss, /\.hltr-close-btn\s*\{/);
   });
+
+  it('does not log debugLog storage writes as settings changes', () => {
+    assert.match(contentJs, /const relevantChangedKeys = \[\]/);
+    assert.match(contentJs, /if \(!relevantChangedKeys\.length\) return;/);
+    assert.doesNotMatch(contentJs, /changedKeys: Object\.keys\(changes\)/);
+  });
 });
