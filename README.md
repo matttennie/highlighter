@@ -54,3 +54,7 @@ npm test
 ```bash
 ELEVENLABS_API_KEY=your_key node tests/playwright-extension-check.mjs
 ```
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
