@@ -83,10 +83,9 @@ describe('ElevenLabs request path', () => {
     assert.match(backgroundJs, /SUPPORTED_MODEL_IDS\.has\(data\.modelId\) \? data\.modelId : DEFAULT_MODEL_ID/);
   });
 
-  it('filters voice results down to selectable voices', () => {
+  it('filters voice results down to available voices', () => {
     assert.match(backgroundJs, /function isSelectableVoice\(voice\)/);
-    assert.match(backgroundJs, /voice\.category === 'premade'/);
-    assert.match(backgroundJs, /voice\.is_owner/);
+    assert.match(backgroundJs, /voice && voice\.voice_id/);
     assert.match(backgroundJs, /payload\.voices\s*\.filter\(isSelectableVoice\)/s);
   });
 });

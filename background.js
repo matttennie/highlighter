@@ -18,10 +18,8 @@ const SUPPORTED_MODEL_IDS = new Set([
 ]);
 
 function isSelectableVoice(voice) {
-  if (!voice || typeof voice !== 'object') return false;
-  if (voice.category === 'premade') return true;
-  if (voice.is_owner) return true;
-  return false;
+  // Broaden to include all voices returned by the API that have an ID
+  return !!(voice && voice.voice_id);
 }
 
 function getStorageSettings() {
@@ -465,6 +463,17 @@ async function requestElevenLabsTts({ apiKey, modelId, normalizedSpeed, requestI
       textLength: text.length,
       speed: normalizedSpeed,
     });
+    const body = {
+      text,
+      model_id: modelId,
+    };
+
+    // ElevenLabs only supports 'speed' for Flash/Turbo models as of recent API updates.
+    // Including it for Multilingual v2 or older models will cause a 400 error.
+    if (modelId.includes('flash') || modelId.includes('turbo')) {
+      body.voice_settings = { speed: normalizedSpeed };
+    }
+
     res = await fetchWithTimeout(url, {
       method: 'POST',
       headers: {
@@ -472,11 +481,7 @@ async function requestElevenLabsTts({ apiKey, modelId, normalizedSpeed, requestI
         'Content-Type': 'application/json',
         Accept: 'audio/mpeg',
       },
-      body: JSON.stringify({
-        text,
-        model_id: modelId,
-        voice_settings: { speed: normalizedSpeed },
-      }),
+      body: JSON.stringify(body),
     });
   } catch (err) {
     if (err.name === 'AbortError') {
