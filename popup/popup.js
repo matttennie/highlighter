@@ -1,4 +1,5 @@
 const tokenInput = document.getElementById('apiToken');
+const inworldTokenInput = document.getElementById('inworldApiToken');
 const modelSelect = document.getElementById('modelId');
 const voiceSelect = document.getElementById('defaultVoice');
 const speedSelect = document.getElementById('defaultSpeed');
@@ -14,6 +15,7 @@ const DEFAULT_VOICE_ID = 'JBFqnCBsd6RMkjVDRZzb';
 const DEFAULT_MODEL_ID = 'eleven_flash_v2_5';
 const LOG_PREFIX = '[Highlighter Popup]';
 const DEBUG_LOG_KEY = 'debugLog';
+const INWORLD_KEY_NAME = 'inworld_Highlighter_API_Key';
 const MODEL_OPTIONS = [
   { value: 'eleven_flash_v2_5', label: 'Flash v2.5 (recommended)' },
   { value: 'eleven_turbo_v2_5', label: 'Turbo v2.5' },
@@ -21,6 +23,7 @@ const MODEL_OPTIONS = [
 ];
 let statusTimer = 0;
 let tokenSaveTimer = 0;
+let inworldTokenSaveTimer = 0;
 
 function logDebug(event, details = {}) {
   console.log(`${LOG_PREFIX} ${event}`, details);
@@ -73,7 +76,7 @@ function syncElevenLabsUi(savedModelId, savedVoiceId) {
 
 // Load saved settings
 chrome.storage.local.get(
-  ['apiKey', 'elApiKey', 'modelId', 'defaultVoice', 'defaultSpeed', 'articleMode'],
+  ['apiKey', 'elApiKey', 'modelId', 'defaultVoice', 'defaultSpeed', 'articleMode', INWORLD_KEY_NAME],
   (data) => {
     const storageError = chrome.runtime.lastError?.message || null;
     if (storageError) {
@@ -82,14 +85,19 @@ chrome.storage.local.get(
       return;
     }
     const savedApiKey = data.apiKey || data.elApiKey || '';
+    const savedInworldKey = data[INWORLD_KEY_NAME] || '';
+
     logDebug('settings-loaded', {
       hasApiKey: Boolean(savedApiKey),
+      hasInworldKey: Boolean(savedInworldKey),
       modelId: data.modelId || null,
       defaultVoice: data.defaultVoice || null,
       defaultSpeed: data.defaultSpeed || null,
       articleMode: data.articleMode,
     });
     if (savedApiKey) tokenInput.value = savedApiKey;
+    if (savedInworldKey) inworldTokenInput.value = savedInworldKey;
+
     syncElevenLabsUi(data.modelId, data.defaultVoice);
     if (data.defaultSpeed) speedSelect.value = data.defaultSpeed;
     if (data.articleMode !== undefined) articleToggle.checked = data.articleMode;
@@ -119,6 +127,14 @@ function saveApiKey(value) {
   chrome.storage.local.set({ apiKey: value, elApiKey: value }, () => {
     const error = chrome.runtime.lastError?.message || null;
     showStatus(error ? 'Could not save API key' : 'Saved');
+  });
+}
+
+function saveInworldApiKey(value) {
+  logDebug('save-inworld-api-key', { hasInworldKey: Boolean(value) });
+  chrome.storage.local.set({ [INWORLD_KEY_NAME]: value }, () => {
+    const error = chrome.runtime.lastError?.message || null;
+    showStatus(error ? 'Could not save Inworld API key' : 'Saved');
   });
 }
 
@@ -206,6 +222,14 @@ function saveTokenSoon() {
   }, 250);
 }
 
+function saveInworldTokenSoon() {
+  clearTimeout(inworldTokenSaveTimer);
+  inworldTokenSaveTimer = setTimeout(() => {
+    saveInworldApiKey(inworldTokenInput.value.trim());
+    inworldTokenSaveTimer = 0;
+  }, 250);
+}
+
 function formatDebugEntries(entries) {
   return entries
     .map((entry) => {
@@ -257,9 +281,18 @@ tokenInput.addEventListener('blur', () => {
   tokenSaveTimer = 0;
   loadVoices(voiceSelect.value || DEFAULT_VOICE_ID);
 });
+
+inworldTokenInput.addEventListener('input', saveInworldTokenSoon);
+inworldTokenInput.addEventListener('blur', () => {
+  clearTimeout(inworldTokenSaveTimer);
+  saveInworldApiKey(inworldTokenInput.value.trim());
+  inworldTokenSaveTimer = 0;
+});
+
 modelSelect.addEventListener('change', () => save('modelId', modelSelect.value));
 voiceSelect.addEventListener('change', () => save('defaultVoice', voiceSelect.value));
 speedSelect.addEventListener('change', () => save('defaultSpeed', speedSelect.value));
-articleToggle.addEventListener('change', () => save('articleMode', articleToggle.checked));
+articleMode.addEventListener('change', () => save('articleMode', articleMode.checked));
 copyDebugLogBtn.addEventListener('click', copyDebugLog);
 clearDebugLogBtn.addEventListener('click', clearDebugLog);
+
