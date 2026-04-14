@@ -1039,7 +1039,9 @@
         message: pbAudio?.error?.message || null,
         readyState: pbAudio?.readyState ?? null,
       });
-      console.warn(`${LOG_PREFIX} Audio element error — falling back to speechSynthesis`);
+      // GitHub/strict sites block data/blob audio via CSP.
+      // We log this but don't warn alarms, as the fallback is intended.
+      showPlayerWarning('Site security restricted audio; using system voice');
       releaseCurrentAudioElement();
       fallbackSpeechSynthesis(text, speed, capturedId);
     }, { once: true });
@@ -1062,7 +1064,7 @@
           name: err?.name || null,
         });
         // FIX 5: Also fall back on play() promise rejection (another CSP vector)
-        console.warn(`${LOG_PREFIX} Audio play() rejected — falling back to speechSynthesis:`, err.message);
+        showPlayerWarning('Playback restricted; using system voice');
         releaseCurrentAudioElement();
         fallbackSpeechSynthesis(text, speed, capturedId);
       });
