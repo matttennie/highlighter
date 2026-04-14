@@ -90,8 +90,10 @@ function flushLogsToStorage() {
 }
 
 function logDebug(event, details = {}) {
-  console.log(`${LOG_PREFIX} ${event}`, details);
-  persistDebugEvent('background', event, details);
+  // Ensure details are stringified if they aren't primitive, to avoid [object Object] in logs
+  const safeDetails = (details && typeof details === 'object') ? JSON.parse(JSON.stringify(details)) : details;
+  console.log(`${LOG_PREFIX} ${event}`, safeDetails);
+  persistDebugEvent('background', event, safeDetails);
 }
 
 // ── Context menu setup ──────────────────────────────────────────────
@@ -551,6 +553,7 @@ async function audioResponseFromHttp(res, url, mimeType, requestId) {
 function normalizeSpeed(speed) {
   const parsed = parseFloat(speed);
   if (!Number.isFinite(parsed)) return 1.0;
+  // ElevenLabs strictly enforces [0.7, 1.2]. 1.25 will throw a 400 error.
   return Math.max(0.7, Math.min(1.2, parsed));
 }
 
