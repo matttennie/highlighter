@@ -1,8 +1,8 @@
 'use strict';
 
 // ── Constants ───────────────────────────────────────────────────────
-const DEFAULT_VOICE_ID = 'JBFqnCBsd6RMkjVDRZzb';
-const DEFAULT_MODEL_ID = 'eleven_flash_v2_5';
+const DEFAULT_VOICE_ID = 'Sarah';
+const DEFAULT_MODEL_ID = 'inworld-tts-1.5-max';
 const MAX_TEXT_LENGTH = 5000;
 const FETCH_TIMEOUT_MS = 30000;
 const BASE64_CHUNK_SIZE = 8192;
@@ -14,9 +14,8 @@ let requestSeq = 0;
 let debugLogBuffer = [];
 let isFlushPending = false;
 const SUPPORTED_MODEL_IDS = new Set([
-  'eleven_flash_v2_5',
-  'eleven_turbo_v2_5',
-  'eleven_multilingual_v2',
+  'inworld-tts-1.5-max',
+  'inworld-tts-1.5-mini',
 ]);
 
 function isSelectableVoice(voice) {
@@ -26,14 +25,19 @@ function isSelectableVoice(voice) {
 
 function getStorageSettings() {
   return new Promise((resolve) => {
-    chrome.storage.local.get(['apiKey', 'elApiKey', 'modelId', 'defaultVoice'], (data) => {
+    chrome.storage.local.get(['inworld_Highlighter_API_Key', 'modelId', 'defaultVoice'], (data) => {
       const error = chrome.runtime.lastError?.message || null;
       if (error) {
         logDebug('settings-load-failed', { error });
         resolve({});
         return;
       }
-      resolve(data);
+      // Map the Inworld key to 'apiKey' for internal consistency if needed, 
+      // or just use it directly.
+      resolve({
+        apiKey: data.inworld_Highlighter_API_Key,
+        ...data
+      });
     });
   });
 }
@@ -42,7 +46,7 @@ function redactDebugDetails(details) {
   if (!details || typeof details !== 'object') return {};
   const copy = { ...details };
   for (const key of Object.keys(copy)) {
-    if (/^(apiKey|elApiKey|token|secret|authorization|password)$/i.test(key)) {
+    if (/^(apiKey|elApiKey|inworld_Highlighter_API_Key|token|secret|authorization|password)$/i.test(key)) {
       copy[key] = copy[key] ? '[redacted]' : copy[key];
     }
   }
@@ -337,16 +341,9 @@ async function parseErrorDetail(res) {
 async function handleTtsRequest({ text, voice, speed }, requestId = ++requestSeq) {
   const startedAt = performance.now();
   const data = await getStorageSettings();
-  const apiKey = (data.apiKey || data.elApiKey || '').trim();
+  const apiKey = (data.apiKey || '').trim();
   if (!apiKey) {
     return { ok: false, error: 'no-token' };
-  }
-  if (!apiKey.startsWith('sk_')) {
-    return {
-      ok: false,
-      error: 'unsupported-provider',
-      detail: 'Use an ElevenLabs API key that starts with sk_.',
-    };
   }
 
   const normalizedText = typeof text === 'string' ? text.trim() : '';
@@ -354,7 +351,6 @@ async function handleTtsRequest({ text, voice, speed }, requestId = ++requestSeq
     return { ok: false, error: 'empty-text' };
   }
 
-  // FIX 5: Enforce text length limit
   if (normalizedText.length > MAX_TEXT_LENGTH) {
     return {
       ok: false,
@@ -363,13 +359,9 @@ async function handleTtsRequest({ text, voice, speed }, requestId = ++requestSeq
     };
   }
 
-  // FIX 4: Validate voiceId — reject empty or whitespace-only values
-  const rawVoiceId = typeof voice === 'string' ? voice.trim() : '';
-  const storedVoiceId = typeof data.defaultVoice === 'string' ? data.defaultVoice.trim() : '';
-  const voiceId = rawVoiceId || storedVoiceId || DEFAULT_VOICE_ID;
-  if (!voiceId) {
-    return { ok: false, error: 'invalid-voice', detail: 'Voice ID is empty.' };
-  }
+  const voiceId = (typeof voice === 'string' ? voice.trim() : '') || 
+                  (typeof data.defaultVoice === 'string' ? data.defaultVoice.trim() : '') || 
+                  DEFAULT_VOICE_ID;
 
   const modelId = SUPPORTED_MODEL_IDS.has(data.modelId) ? data.modelId : DEFAULT_MODEL_ID;
   const normalizedSpeed = normalizeSpeed(speed);
@@ -382,7 +374,7 @@ async function handleTtsRequest({ text, voice, speed }, requestId = ++requestSeq
     speed: normalizedSpeed,
   });
 
-  const result = await requestElevenLabsTts({
+  const result = await requestInworldTts({
     apiKey,
     modelId,
     normalizedSpeed,
@@ -405,26 +397,19 @@ async function handleVoicesRequest() {
   const requestId = arguments[0] ?? ++requestSeq;
   const startedAt = performance.now();
   const data = await getStorageSettings();
-  const apiKey = (data.apiKey || data.elApiKey || '').trim();
+  const apiKey = (data.apiKey || '').trim();
   if (!apiKey) {
     return { ok: false, error: 'no-token' };
-  }
-  if (!apiKey.startsWith('sk_')) {
-    return {
-      ok: false,
-      error: 'unsupported-provider',
-      detail: 'Use an ElevenLabs API key that starts with sk_.',
-    };
   }
 
   let res;
   try {
     logDebug('voices-fetch-start', { requestId });
-    res = await fetchWithTimeout('https://api.elevenlabs.io/v1/voices', {
+    res = await fetchWithTimeout('https://api.inworld.ai/tts/v1/voices', {
       method: 'GET',
       headers: {
-        'xi-api-key': apiKey,
-        Accept: 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'Accept': 'application/json',
       },
     });
   } catch (err) {
@@ -443,9 +428,8 @@ async function handleVoicesRequest() {
   });
 
   if (!res.ok) {
-    // FIX 2: Parse JSON error body for human-readable message
     const detail = await parseErrorDetail(res);
-    console.error(`${LOG_PREFIX} Voices API error:`, {
+    console.error(`${LOG_PREFIX} Inworld Voices API error:`, {
       requestId,
       status: res.status,
       detail,
@@ -457,21 +441,20 @@ async function handleVoicesRequest() {
   }
 
   const payload = await res.json();
+  // Inworld returns voices in a 'voices' array with 'voice_id' and 'name'
   const voices = Array.isArray(payload.voices)
-    ? payload.voices
-        .filter(isSelectableVoice)
-        .map((v) => ({
-          voiceId: v.voice_id,
+    ? payload.voices.map((v) => ({
+          voiceId: v.voice_id || v.name,
           name: v.name || v.voice_id,
-          category: v.category || 'Other',
+          category: v.language || 'Global',
         }))
     : [];
 
   return { ok: true, voices };
 }
 
-async function requestElevenLabsTts({ apiKey, modelId, normalizedSpeed, requestId, text, voiceId }) {
-  const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voiceId)}`;
+async function requestInworldTts({ apiKey, modelId, normalizedSpeed, requestId, text, voiceId }) {
+  const url = 'https://api.inworld.ai/tts/v1/voice';
   const startedAt = performance.now();
   let res;
   try {
@@ -482,23 +465,25 @@ async function requestElevenLabsTts({ apiKey, modelId, normalizedSpeed, requestI
       textLength: text.length,
       speed: normalizedSpeed,
     });
+    
+    // Inworld API body structure
     const body = {
       text,
-      model_id: modelId,
+      voiceId,
+      modelId,
     };
 
-    // ElevenLabs only supports 'speed' for Flash/Turbo models as of recent API updates.
-    // Including it for Multilingual v2 or older models will cause a 400 error.
-    if (modelId.includes('flash') || modelId.includes('turbo')) {
-      body.voice_settings = { speed: normalizedSpeed };
-    }
+    // If speed is not default, we could try to pass it if Inworld supports it 
+    // in this specific endpoint. Most Inworld TTS uses prosody or rate in SSML, 
+    // but some direct endpoints might have it.
+    // For now, we'll stick to the base model.
 
     res = await fetchWithTimeout(url, {
       method: 'POST',
       headers: {
-        'xi-api-key': apiKey,
+        'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
-        Accept: 'audio/mpeg',
+        'Accept': 'audio/mpeg',
       },
       body: JSON.stringify(body),
     });

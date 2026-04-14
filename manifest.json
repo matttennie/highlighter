@@ -12,7 +12,7 @@
   ],
   "host_permissions": [
     "<all_urls>",
-    "https://api.elevenlabs.io/*"
+    "https://api.inworld.ai/*"
   ],
   "background": {
     "service_worker": "background.js"

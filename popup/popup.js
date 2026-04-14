@@ -1,28 +1,19 @@
-const tokenInput = document.getElementById('apiToken');
 const inworldTokenInput = document.getElementById('inworldApiToken');
 const modelSelect = document.getElementById('modelId');
 const voiceSelect = document.getElementById('defaultVoice');
 const speedSelect = document.getElementById('defaultSpeed');
 const articleToggle = document.getElementById('articleMode');
-const providerHint = document.getElementById('providerHint');
-const modelHint = document.getElementById('modelHint');
-const voiceHint = document.getElementById('voiceHint');
 const statusEl = document.getElementById('status');
 const copyDebugLogBtn = document.getElementById('copyDebugLog');
 const clearDebugLogBtn = document.getElementById('clearDebugLog');
 const debugPreview = document.getElementById('debugPreview');
-const DEFAULT_VOICE_ID = 'JBFqnCBsd6RMkjVDRZzb';
-const DEFAULT_MODEL_ID = 'eleven_flash_v2_5';
+const DEFAULT_VOICE_ID = 'Sarah';
+const DEFAULT_MODEL_ID = 'inworld-tts-1.5-max';
 const LOG_PREFIX = '[Highlighter Popup]';
 const DEBUG_LOG_KEY = 'debugLog';
 const INWORLD_KEY_NAME = 'inworld_Highlighter_API_Key';
-const MODEL_OPTIONS = [
-  { value: 'eleven_flash_v2_5', label: 'Flash v2.5 (recommended)' },
-  { value: 'eleven_turbo_v2_5', label: 'Turbo v2.5' },
-  { value: 'eleven_multilingual_v2', label: 'Multilingual v2' },
-];
+
 let statusTimer = 0;
-let tokenSaveTimer = 0;
 let inworldTokenSaveTimer = 0;
 
 function logDebug(event, details = {}) {
@@ -48,35 +39,9 @@ function persistDebugEvent(source, event, details = {}) {
   );
 }
 
-function isSupportedModelId(modelId) {
-  return MODEL_OPTIONS.some((model) => model.value === modelId);
-}
-
-function syncElevenLabsUi(savedModelId, savedVoiceId) {
-  providerHint.textContent = 'Enter an ElevenLabs key that starts with sk_.';
-  modelHint.textContent = 'Model options for ElevenLabs.';
-  voiceHint.textContent = 'The dropdown shows API-returned ElevenLabs voices when available; otherwise it falls back to the configured voice.';
-
-  const modelFragment = document.createDocumentFragment();
-  for (const model of MODEL_OPTIONS) {
-    const option = document.createElement('option');
-    option.value = model.value;
-    option.textContent = model.label;
-    modelFragment.appendChild(option);
-  }
-  modelSelect.replaceChildren(modelFragment);
-  const effectiveModelId = isSupportedModelId(savedModelId) ? savedModelId : DEFAULT_MODEL_ID;
-  modelSelect.value = effectiveModelId;
-  if (savedModelId && savedModelId !== effectiveModelId) {
-    logDebug('stale-model-reset', { from: savedModelId, to: effectiveModelId });
-    chrome.storage.local.set({ modelId: effectiveModelId });
-  }
-  ensureVoiceOption(savedVoiceId || DEFAULT_VOICE_ID, 'Configured voice');
-}
-
 // Load saved settings
 chrome.storage.local.get(
-  ['apiKey', 'elApiKey', 'modelId', 'defaultVoice', 'defaultSpeed', 'articleMode', INWORLD_KEY_NAME],
+  ['modelId', 'defaultVoice', 'defaultSpeed', 'articleMode', INWORLD_KEY_NAME],
   (data) => {
     const storageError = chrome.runtime.lastError?.message || null;
     if (storageError) {
@@ -84,23 +49,24 @@ chrome.storage.local.get(
       showStatus('Could not load settings');
       return;
     }
-    const savedApiKey = data.apiKey || data.elApiKey || '';
     const savedInworldKey = data[INWORLD_KEY_NAME] || '';
 
     logDebug('settings-loaded', {
-      hasApiKey: Boolean(savedApiKey),
       hasInworldKey: Boolean(savedInworldKey),
       modelId: data.modelId || null,
       defaultVoice: data.defaultVoice || null,
       defaultSpeed: data.defaultSpeed || null,
       articleMode: data.articleMode,
     });
-    if (savedApiKey) tokenInput.value = savedApiKey;
     if (savedInworldKey) inworldTokenInput.value = savedInworldKey;
 
-    syncElevenLabsUi(data.modelId, data.defaultVoice);
+    if (data.modelId) modelSelect.value = data.modelId;
+    else modelSelect.value = DEFAULT_MODEL_ID;
+
     if (data.defaultSpeed) speedSelect.value = data.defaultSpeed;
     if (data.articleMode !== undefined) articleToggle.checked = data.articleMode;
+    
+    ensureVoiceOption(data.defaultVoice || DEFAULT_VOICE_ID, 'Default Voice');
     loadVoices(data.defaultVoice || DEFAULT_VOICE_ID);
   }
 );
@@ -119,14 +85,6 @@ function save(key, value) {
   chrome.storage.local.set({ [key]: value }, () => {
     const error = chrome.runtime.lastError?.message || null;
     showStatus(error ? 'Could not save setting' : 'Saved');
-  });
-}
-
-function saveApiKey(value) {
-  logDebug('save-api-key', { hasApiKey: Boolean(value) });
-  chrome.storage.local.set({ apiKey: value, elApiKey: value }, () => {
-    const error = chrome.runtime.lastError?.message || null;
-    showStatus(error ? 'Could not save API key' : 'Saved');
   });
 }
 
@@ -174,28 +132,16 @@ function loadVoices(selectedVoice) {
       runtimeError: chrome.runtime.lastError?.message || null,
     });
     if (chrome.runtime.lastError || !response || !response.ok || !response.voices?.length) {
-      ensureVoiceOption(selectedVoice || DEFAULT_VOICE_ID, 'Configured voice');
+      ensureVoiceOption(selectedVoice || DEFAULT_VOICE_ID, 'Default Voice');
       return;
     }
 
-    const groups = new Map();
-    for (const voice of response.voices) {
-      const category = voice.category || 'Other';
-      if (!groups.has(category)) groups.set(category, []);
-      groups.get(category).push(voice);
-    }
-
     const fragment = document.createDocumentFragment();
-    for (const [category, voices] of groups) {
-      const optgroup = document.createElement('optgroup');
-      optgroup.label = category;
-      for (const voice of voices) {
-        const option = document.createElement('option');
-        option.value = voice.voiceId;
-        option.textContent = voice.name;
-        optgroup.appendChild(option);
-      }
-      fragment.appendChild(optgroup);
+    for (const voice of response.voices) {
+      const option = document.createElement('option');
+      option.value = voice.voiceId;
+      option.textContent = voice.name;
+      fragment.appendChild(option);
     }
 
     voiceSelect.replaceChildren(fragment);
@@ -203,23 +149,10 @@ function loadVoices(selectedVoice) {
       ? selectedVoice
       : DEFAULT_VOICE_ID;
     voiceSelect.value = effectiveVoiceId;
-    if (!voiceSelect.value) {
-      ensureVoiceOption(DEFAULT_VOICE_ID, 'Configured voice');
-      voiceSelect.value = DEFAULT_VOICE_ID;
-    }
-    if (effectiveVoiceId !== selectedVoice && effectiveVoiceId) {
-      logDebug('stale-voice-reset', { from: selectedVoice, to: effectiveVoiceId });
-      setDefaultVoice(effectiveVoiceId);
+    if (!voiceSelect.value && voiceSelect.options.length > 0) {
+      voiceSelect.selectedIndex = 0;
     }
   });
-}
-
-function saveTokenSoon() {
-  clearTimeout(tokenSaveTimer);
-  tokenSaveTimer = setTimeout(() => {
-    saveApiKey(tokenInput.value.trim());
-    tokenSaveTimer = 0;
-  }, 250);
 }
 
 function saveInworldTokenSoon() {
@@ -274,25 +207,17 @@ function clearDebugLog() {
   });
 }
 
-tokenInput.addEventListener('input', saveTokenSoon);
-tokenInput.addEventListener('blur', () => {
-  clearTimeout(tokenSaveTimer);
-  saveApiKey(tokenInput.value.trim());
-  tokenSaveTimer = 0;
-  loadVoices(voiceSelect.value || DEFAULT_VOICE_ID);
-});
-
 inworldTokenInput.addEventListener('input', saveInworldTokenSoon);
 inworldTokenInput.addEventListener('blur', () => {
   clearTimeout(inworldTokenSaveTimer);
   saveInworldApiKey(inworldTokenInput.value.trim());
   inworldTokenSaveTimer = 0;
+  loadVoices(voiceSelect.value || DEFAULT_VOICE_ID);
 });
 
 modelSelect.addEventListener('change', () => save('modelId', modelSelect.value));
 voiceSelect.addEventListener('change', () => save('defaultVoice', voiceSelect.value));
 speedSelect.addEventListener('change', () => save('defaultSpeed', speedSelect.value));
-articleMode.addEventListener('change', () => save('articleMode', articleMode.checked));
+articleToggle.addEventListener('change', () => save('articleMode', articleToggle.checked));
 copyDebugLogBtn.addEventListener('click', copyDebugLog);
 clearDebugLogBtn.addEventListener('click', clearDebugLog);
-
