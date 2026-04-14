@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Highlighter TTS",
+  "name": "Highlighter TTS (Inworld)",
   "version": "0.1.0",
-  "description": "Select text with a paint-brush stroke and hear it read aloud via ElevenLabs TTS",
+  "description": "Select text with a paint-brush stroke and hear it read aloud via Inworld AI TTS",
   "minimum_chrome_version": "102",
   "permissions": [
     "activeTab",
