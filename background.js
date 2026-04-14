@@ -9,8 +9,10 @@ const BASE64_CHUNK_SIZE = 8192;
 const LOG_PREFIX = '[Highlighter TTS]';
 const DEBUG_LOG_KEY = 'debugLog';
 const DEBUG_LOG_LIMIT = 250;
+const LOG_FLUSH_INTERVAL_MS = 2000;
 let requestSeq = 0;
-let debugWriteQueue = Promise.resolve();
+let debugLogBuffer = [];
+let isFlushPending = false;
 const SUPPORTED_MODEL_IDS = new Set([
   'eleven_flash_v2_5',
   'eleven_turbo_v2_5',
@@ -54,9 +56,37 @@ function persistDebugEvent(source, event, details = {}) {
     event,
     details: redactDebugDetails(details),
   };
-  debugWriteQueue = debugWriteQueue
-    .catch(() => {})
-    .then(() => appendDebugEntry(entry));
+  debugLogBuffer.push(entry);
+  scheduleLogFlush();
+}
+
+function scheduleLogFlush() {
+  if (isFlushPending || debugLogBuffer.length === 0) return;
+  isFlushPending = true;
+  // Use a slight delay to batch multiple rapid events
+  setTimeout(flushLogsToStorage, LOG_FLUSH_INTERVAL_MS);
+}
+
+function flushLogsToStorage() {
+  if (debugLogBuffer.length === 0) {
+    isFlushPending = false;
+    return;
+  }
+
+  const toPersist = [...debugLogBuffer];
+  debugLogBuffer = [];
+
+  chrome.storage.local.get([DEBUG_LOG_KEY], (data) => {
+    void chrome.runtime.lastError;
+    const current = Array.isArray(data[DEBUG_LOG_KEY]) ? data[DEBUG_LOG_KEY] : [];
+    const updated = [...current, ...toPersist].slice(-DEBUG_LOG_LIMIT);
+    chrome.storage.local.set({ [DEBUG_LOG_KEY]: updated }, () => {
+      void chrome.runtime.lastError;
+      isFlushPending = false;
+      // If new logs arrived during the write, schedule another flush
+      if (debugLogBuffer.length > 0) scheduleLogFlush();
+    });
+  });
 }
 
 function logDebug(event, details = {}) {
@@ -64,30 +94,10 @@ function logDebug(event, details = {}) {
   persistDebugEvent('background', event, details);
 }
 
-function appendDebugEntry(entry) {
-  return new Promise((resolve) => {
-    chrome.storage.local.get([DEBUG_LOG_KEY], (data) => {
-      const getError = chrome.runtime.lastError?.message || null;
-      if (getError) {
-        resolve();
-        return;
-      }
-      const current = Array.isArray(data[DEBUG_LOG_KEY]) ? data[DEBUG_LOG_KEY] : [];
-      current.push(entry);
-      const trimmed = current.slice(-DEBUG_LOG_LIMIT);
-      chrome.storage.local.set({ [DEBUG_LOG_KEY]: trimmed }, () => {
-        void chrome.runtime.lastError;
-        resolve();
-      });
-    });
-  });
-}
-
 // ── Context menu setup ──────────────────────────────────────────────
 function createContextMenu() {
   chrome.contextMenus.removeAll(() => {
-    const removeError = chrome.runtime.lastError?.message || null;
-    if (removeError) logDebug('context-menu-remove-failed', { error: removeError });
+    void chrome.runtime.lastError;
     chrome.contextMenus.create(
       {
         id: 'toggle-highlight-mode',
@@ -95,16 +105,23 @@ function createContextMenu() {
         contexts: ['page', 'selection'],
       },
       () => {
-        const message = chrome.runtime.lastError?.message || null;
-        logDebug('context-menu-created', { error: message });
+        const error = chrome.runtime.lastError?.message || null;
+        logDebug('context-menu-created', { error });
       }
     );
   });
 }
 
-chrome.runtime.onInstalled.addListener(createContextMenu);
-chrome.runtime.onStartup.addListener(createContextMenu);
-createContextMenu();
+chrome.runtime.onInstalled.addListener(() => {
+  logDebug('extension-installed');
+  createContextMenu();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  logDebug('extension-startup');
+  // Context menus persist, but re-creating on startup ensures they are synced
+  createContextMenu();
+});
 
 // ── Tab messaging helpers ───────────────────────────────────────────
 function canInjectIntoTab(tabId, url = '') {

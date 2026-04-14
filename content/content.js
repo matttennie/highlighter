@@ -1,6 +1,12 @@
 (() => {
   'use strict';
-  if (window.__highlighterTtsContentLoaded) return;
+  // If the same version is already loaded, skip. 
+  // If a different version (e.g. after reload) is loaded, we allow this one to 
+  // take over but we try to avoid double-initializing as much as possible.
+  if (window.__highlighterTtsExtensionId === chrome.runtime.id) {
+    return;
+  }
+  window.__highlighterTtsExtensionId = chrome.runtime.id;
   window.__highlighterTtsContentLoaded = true;
 
   // ── Constants ──────────────────────────────────────────────────────
