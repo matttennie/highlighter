@@ -63,11 +63,19 @@ chrome.storage.local.get(
     if (data.modelId) modelSelect.value = data.modelId;
     else modelSelect.value = DEFAULT_MODEL_ID;
 
+    // Reset stale ElevenLabs voice IDs if they are still in storage
+    let effectiveVoice = data.defaultVoice || DEFAULT_VOICE_ID;
+    if (effectiveVoice.length > 15) { // ElevenLabs IDs are long hashes, Inworld are names
+      effectiveVoice = DEFAULT_VOICE_ID;
+      logDebug('stale-voice-reset-on-load', { from: data.defaultVoice, to: effectiveVoice });
+      chrome.storage.local.set({ defaultVoice: effectiveVoice });
+    }
+
     if (data.defaultSpeed) speedSelect.value = data.defaultSpeed;
     if (data.articleMode !== undefined) articleToggle.checked = data.articleMode;
     
-    ensureVoiceOption(data.defaultVoice || DEFAULT_VOICE_ID, 'Default Voice');
-    loadVoices(data.defaultVoice || DEFAULT_VOICE_ID);
+    ensureVoiceOption(effectiveVoice, 'Default Voice');
+    loadVoices(effectiveVoice);
   }
 );
 

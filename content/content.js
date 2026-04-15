@@ -10,7 +10,7 @@
   window.__highlighterTtsContentLoaded = true;
 
   // ── Constants ──────────────────────────────────────────────────────
-  const DEFAULT_VOICE_ID = 'JBFqnCBsd6RMkjVDRZzb';
+  const DEFAULT_VOICE_ID = 'Sarah';
   const CURSOR_SIZE      = 22;
   const LINE_TOLERANCE   = 14;  // for END line detection (confirmed working)
   const SPEEDS           = [0.7, 0.75, 0.9, 1.0, 1.1, 1.2];
