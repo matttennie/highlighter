@@ -441,13 +441,18 @@ async function handleVoicesRequest() {
   }
 
   const payload = await res.json();
-  // Inworld returns voices in a 'voices' array with 'voice_id' and 'name'
+  // Inworld API might use 'name' for the full resource path and 'displayName' for the human name.
+  // We'll be robust here and check multiple fields.
   const voices = Array.isArray(payload.voices)
-    ? payload.voices.map((v) => ({
-          voiceId: v.voice_id || v.name,
-          name: v.name || v.voice_id,
-          category: v.language || 'Global',
-        }))
+    ? payload.voices.map((v) => {
+          const name = v.displayName || v.name || v.voice_id || 'Unknown Voice';
+          const voiceId = v.voice_id || v.name || name;
+          return {
+            voiceId,
+            name,
+            category: v.language || 'Global',
+          };
+        })
     : [];
 
   return { ok: true, voices };
