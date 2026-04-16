@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Highlighter TTS (Inworld)",
+  "name": "Highlighter (INWORLD)",
   "version": "0.1.0",
   "description": "Select text with a paint-brush stroke and hear it read aloud via Inworld AI TTS",
   "minimum_chrome_version": "102",
