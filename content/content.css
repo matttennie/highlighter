@@ -281,6 +281,55 @@
   background: rgba(40, 0, 0, 0.94);
   color: #ffb0b0;
 }
+.hltr-toast.hltr-toast-detailed {
+  pointer-events: auto;
+}
+.hltr-toast-msg {
+  font-weight: 500;
+  margin-bottom: 6px;
+}
+.hltr-toast-details {
+  margin: 0 0 8px;
+  padding: 8px 10px;
+  max-height: 180px;
+  overflow: auto;
+  background: rgba(0, 0, 0, 0.35);
+  color: rgba(255, 255, 255, 0.85);
+  border-radius: 6px;
+  font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  user-select: text;
+}
+.hltr-toast.hltr-error .hltr-toast-details {
+  color: #ffd0d0;
+}
+.hltr-toast-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+}
+.hltr-toast-copy,
+.hltr-toast-dismiss {
+  pointer-events: auto;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.08);
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.hltr-toast-copy:hover,
+.hltr-toast-dismiss:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+.hltr-toast.hltr-error .hltr-toast-copy,
+.hltr-toast.hltr-error .hltr-toast-dismiss {
+  border-color: rgba(255, 176, 176, 0.35);
+}
 @keyframes hltr-toast-in {
   from { opacity: 0; transform: translateY(-4px); }
   to   { opacity: 1; transform: translateY(0); }

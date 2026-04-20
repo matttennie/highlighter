@@ -5,14 +5,14 @@ import {
   toggleActiveTabFromServiceWorker,
 } from './extension-harness.mjs';
 
-const apiKey = process.env.ELEVENLABS_API_KEY;
+const apiKey = process.env.INWORLD_API_KEY;
 const startedAt = Date.now();
 const articleUrl =
   process.env.HIGHLIGHTER_REAL_ARTICLE_URL ||
   'https://developer.chrome.com/blog/longer-esw-lifetimes';
 
 if (!apiKey) {
-  console.error('ELEVENLABS_API_KEY is required');
+  console.error('INWORLD_API_KEY is required');
   process.exit(1);
 }
 

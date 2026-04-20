@@ -6,13 +6,12 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-// ── Error message mapping (from content.js) ────────────────────────
+// ── Error message mapping (mirrors content.js) ─────────────────────
 
 function getErrorMessage(response) {
   if (!response) return 'No response from background';
   switch (response.error) {
-    case 'no-token':          return 'Set ElevenLabs API key in extension settings';
-    case 'unsupported-provider': return response.detail || 'Use an ElevenLabs API key';
+    case 'no-token':          return 'Set Inworld API key in extension settings';
     case 'empty-text':        return 'Select some text before playing';
     case 'text-too-long':     return response.detail || 'Text exceeds maximum length';
     case 'auth-failed':       return response.detail
@@ -20,7 +19,7 @@ function getErrorMessage(response) {
       : 'Invalid API key';
     case 'billing-required':  return response.detail
       ? `API error (402)\n${truncateDetail(response.detail)}`
-      : 'API error (402)\nCheck ElevenLabs billing/quota';
+      : 'API error (402)\nCheck Inworld billing/quota';
     case 'rate-limited':      return 'Rate limited — try again shortly';
     case 'timeout':           return 'Request timed out — try again';
     case 'api-error':         return response.detail
@@ -46,11 +45,7 @@ describe('getErrorMessage', () => {
   });
 
   it('maps no-token', () => {
-    assert.match(getErrorMessage({ error: 'no-token' }), /ElevenLabs/i);
-  });
-
-  it('maps unsupported-provider', () => {
-    assert.match(getErrorMessage({ error: 'unsupported-provider' }), /ElevenLabs API key/i);
+    assert.match(getErrorMessage({ error: 'no-token' }), /Inworld/i);
   });
 
   it('maps empty-text', () => {
@@ -81,15 +76,16 @@ describe('getErrorMessage', () => {
     const msg = getErrorMessage({ error: 'billing-required' });
     assert.match(msg, /402/);
     assert.match(msg, /billing/i);
+    assert.match(msg, /Inworld/i);
   });
 
   it('includes upstream billing-required detail when available', () => {
     const msg = getErrorMessage({
       error: 'billing-required',
-      detail: 'Free users cannot use library voices via the API.',
+      detail: 'Plan quota exceeded.',
     });
     assert.match(msg, /402/);
-    assert.match(msg, /library voices/i);
+    assert.match(msg, /quota exceeded/i);
   });
 
   it('maps rate-limited', () => {
@@ -254,7 +250,7 @@ describe('Request ID staleness guard', () => {
 function normalizePlaybackRate(speed) {
   const parsed = parseFloat(speed);
   if (!Number.isFinite(parsed)) return 1.0;
-  return Math.max(0.7, Math.min(1.2, parsed));
+  return Math.max(0.5, Math.min(1.5, parsed));
 }
 
 describe('normalizePlaybackRate', () => {
@@ -266,23 +262,23 @@ describe('normalizePlaybackRate', () => {
     assert.equal(normalizePlaybackRate(Infinity), 1.0);
   });
 
-  it('clamps values below minimum to 0.7', () => {
-    assert.equal(normalizePlaybackRate(0.25), 0.7);
-    assert.equal(normalizePlaybackRate(0), 0.7);
-    assert.equal(normalizePlaybackRate(-1), 0.7);
+  it('clamps values below minimum to 0.5', () => {
+    assert.equal(normalizePlaybackRate(0.25), 0.5);
+    assert.equal(normalizePlaybackRate(0), 0.5);
+    assert.equal(normalizePlaybackRate(-1), 0.5);
   });
 
   it('preserves in-range values', () => {
     assert.equal(normalizePlaybackRate('1.1'), 1.1);
-    assert.equal(normalizePlaybackRate(0.7), 0.7);
-    assert.equal(normalizePlaybackRate(1.2), 1.2);
+    assert.equal(normalizePlaybackRate(0.5), 0.5);
+    assert.equal(normalizePlaybackRate(1.5), 1.5);
     assert.equal(normalizePlaybackRate(1), 1.0);
   });
 
-  it('clamps values above maximum to 1.2', () => {
-    assert.equal(normalizePlaybackRate(3), 1.2);
-    assert.equal(normalizePlaybackRate(2.1), 1.2);
-    assert.equal(normalizePlaybackRate(100), 1.2);
+  it('clamps values above maximum to 1.5', () => {
+    assert.equal(normalizePlaybackRate(3), 1.5);
+    assert.equal(normalizePlaybackRate(2.1), 1.5);
+    assert.equal(normalizePlaybackRate(100), 1.5);
   });
 });
 

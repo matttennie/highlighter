@@ -6,11 +6,11 @@ import {
   toggleActiveTabFromServiceWorker,
 } from './extension-harness.mjs';
 
-const apiKey = process.env.ELEVENLABS_API_KEY;
+const apiKey = process.env.INWORLD_API_KEY;
 const startedAt = Date.now();
 
 if (!apiKey) {
-  console.error('ELEVENLABS_API_KEY is required');
+  console.error('INWORLD_API_KEY is required');
   process.exit(1);
 }
 

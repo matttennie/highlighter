@@ -10,16 +10,20 @@ const backgroundJs = fs.readFileSync(path.join(rootDir, 'background.js'), 'utf8'
 
 describe('popup.html', () => {
   it('associates labels with form controls', () => {
-    for (const id of ['apiToken', 'modelId', 'defaultVoice', 'defaultSpeed', 'articleMode']) {
+    for (const id of ['inworldApiToken', 'modelId', 'defaultVoice', 'defaultSpeed', 'articleMode']) {
       assert.match(popupHtml, new RegExp(`<label[^>]*for="${id}"`, 'i'));
     }
   });
 
-  it('renders ElevenLabs-specific hints', () => {
+  it('renders Inworld-specific hints', () => {
     assert.match(popupHtml, /id="providerHint"/i);
-    assert.match(popupHtml, /ElevenLabs API Key/i);
-    assert.match(popupHtml, /dropdown shows API-returned ElevenLabs voices when available/i);
+    assert.match(popupHtml, /Inworld API Key/i);
+    assert.match(popupHtml, /voices returned by the Inworld API/i);
     assert.match(popupHtml, /<select id="defaultVoice"><\/select>/i);
+  });
+
+  it('does not reference ElevenLabs anywhere', () => {
+    assert.doesNotMatch(popupHtml, /elevenlabs/i);
   });
 });
 
@@ -29,16 +33,26 @@ describe('popup.js', () => {
     assert.match(popupJs, /statusTimer\s*=\s*setTimeout/);
   });
 
-  it('persists the API key on input and blur instead of only on change', () => {
-    assert.match(popupJs, /tokenInput\.addEventListener\('input',\s*saveTokenSoon\)/);
-    assert.match(popupJs, /tokenInput\.addEventListener\('blur'/);
+  it('persists the Inworld API key on input and blur instead of only on change', () => {
+    assert.match(popupJs, /inworldTokenInput\.addEventListener\('input',\s*saveInworldTokenSoon\)/);
+    assert.match(popupJs, /inworldTokenInput\.addEventListener\('blur'/);
   });
 
   it('loads voice options dynamically from the background worker', () => {
     assert.match(popupJs, /chrome\.runtime\.sendMessage\(\{ type: 'voices-request' \}/);
-    assert.match(popupJs, /function syncElevenLabsUi\(savedModelId, savedVoiceId\)/);
     assert.match(popupJs, /function isSupportedModelId\(modelId\)/);
     assert.match(popupJs, /function setDefaultVoice\(voiceId\)/);
+  });
+
+  it('resets stale ElevenLabs-shaped voice IDs on load', () => {
+    assert.match(popupJs, /function looksLikeLegacyVoiceId/);
+    assert.match(popupJs, /stale-voice-reset-on-load/);
+  });
+
+  it('does not reference ElevenLabs API keys or models', () => {
+    assert.doesNotMatch(popupJs, /\belApiKey\b/);
+    assert.doesNotMatch(popupJs, /eleven_flash|eleven_turbo|eleven_multilingual/);
+    assert.doesNotMatch(popupJs, /xi-api-key/);
   });
 });
 
@@ -49,6 +63,6 @@ describe('default voice ID consistency', () => {
     assert.ok(popupMatch, 'popup.js should define DEFAULT_VOICE_ID');
     assert.ok(bgMatch, 'background.js should define DEFAULT_VOICE_ID');
     assert.equal(popupMatch[1], bgMatch[1], 'DEFAULT_VOICE_ID must match across files');
-    assert.equal(popupMatch[1], 'JBFqnCBsd6RMkjVDRZzb', 'DEFAULT_VOICE_ID should match the working ElevenLabs voice');
+    assert.equal(popupMatch[1], 'Ashley', 'DEFAULT_VOICE_ID should be an Inworld voice name');
   });
 });

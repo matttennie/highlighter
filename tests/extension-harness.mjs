@@ -97,10 +97,9 @@ export async function launchExtension({ apiKey, startedAt, profilePrefix = 'high
   await popupPage.evaluate(
     async ({ key }) => {
       await chrome.storage.local.set({
-        apiKey: key,
-        elApiKey: key,
-        modelId: 'eleven_flash_v2_5',
-        defaultVoice: 'JBFqnCBsd6RMkjVDRZzb',
+        inworld_Highlighter_API_Key: key,
+        modelId: 'inworld-tts-1.5-max',
+        defaultVoice: 'Sarah',
         defaultSpeed: '1',
       });
     },

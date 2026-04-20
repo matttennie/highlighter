@@ -6,10 +6,11 @@ import { describe, it } from 'node:test';
 const rootDir = path.resolve(import.meta.dirname, '..');
 const backgroundJs = fs.readFileSync(path.join(rootDir, 'background.js'), 'utf8');
 
+// Mirror of background.js#normalizeSpeed — keep in sync when the API range changes.
 function normalizeSpeed(speed) {
   const parsed = parseFloat(speed);
   if (!Number.isFinite(parsed)) return 1;
-  return Math.max(0.7, Math.min(1.2, parsed));
+  return Math.max(0.5, Math.min(1.5, parsed));
 }
 
 describe('background command handling', () => {
@@ -26,12 +27,11 @@ describe('background command handling', () => {
   it('handles dynamic voice-list requests', () => {
     assert.match(backgroundJs, /if \(msg\.type === 'voices-request'\)/);
     assert.match(backgroundJs, /async function handleVoicesRequest\(\)/);
-    assert.match(backgroundJs, /https:\/\/api\.elevenlabs\.io\/v1\/voices/);
+    assert.match(backgroundJs, /https:\/\/api\.inworld\.ai\/tts\/v1\/voices/);
   });
 
-  it('requires an ElevenLabs-style key prefix', () => {
-    assert.match(backgroundJs, /apiKey\.startsWith\('sk_'\)/);
-    assert.match(backgroundJs, /Use an ElevenLabs API key that starts with sk_\./);
+  it('reads the Inworld API key from storage under the expected name', () => {
+    assert.match(backgroundJs, /inworld_Highlighter_API_Key/);
   });
 });
 
@@ -45,23 +45,16 @@ describe('normalizeSpeed', () => {
   });
 
   it('clamps speeds to the supported range', () => {
-    assert.equal(normalizeSpeed(0.1), 0.7);
+    assert.equal(normalizeSpeed(0.1), 0.5);
     assert.equal(normalizeSpeed(1.1), 1.1);
-    assert.equal(normalizeSpeed(3), 1.2);
+    assert.equal(normalizeSpeed(3), 1.5);
   });
 });
 
 describe('text length validation', () => {
   it('enforces a maximum text length of 5000 characters', () => {
-    assert.match(backgroundJs, /MAX_TEXT_LENGTH\s*=\s*5000/);
+    assert.match(backgroundJs, /MAX_TEXT_LENGTH\s*=\s*2000/);
     assert.match(backgroundJs, /normalizedText\.length > MAX_TEXT_LENGTH/);
-  });
-});
-
-describe('speed in API body', () => {
-  it('includes speed in voice_settings', () => {
-    assert.match(backgroundJs, /voice_settings/);
-    assert.match(backgroundJs, /speed:\s*normalizedSpeed/);
   });
 });
 
@@ -72,10 +65,18 @@ describe('error response JSON parsing', () => {
   });
 });
 
-describe('ElevenLabs request path', () => {
-  it('posts text-to-speech requests to ElevenLabs', () => {
-    assert.match(backgroundJs, /https:\/\/api\.elevenlabs\.io\/v1\/text-to-speech/);
-    assert.match(backgroundJs, /'xi-api-key': apiKey/);
+describe('Inworld request path', () => {
+  it('posts text-to-speech requests to Inworld with Basic auth', () => {
+    assert.match(backgroundJs, /https:\/\/api\.inworld\.ai\/tts\/v1\/voice/);
+    assert.match(backgroundJs, /'Authorization':\s*`Basic \$\{apiKey\}`/);
+    assert.doesNotMatch(backgroundJs, /'Authorization':\s*`Bearer \$\{apiKey\}`/);
+  });
+
+  it('requests JSON response with audioConfig.speakingRate', () => {
+    assert.match(backgroundJs, /'Accept':\s*'application\/json'/);
+    assert.match(backgroundJs, /audioEncoding:\s*'MP3'/);
+    assert.match(backgroundJs, /speakingRate:\s*normalizedSpeed/);
+    assert.match(backgroundJs, /payload\?\.audioContent/);
   });
 
   it('falls back to a supported model when storage contains a stale one', () => {
@@ -83,10 +84,15 @@ describe('ElevenLabs request path', () => {
     assert.match(backgroundJs, /SUPPORTED_MODEL_IDS\.has\(data\.modelId\) \? data\.modelId : DEFAULT_MODEL_ID/);
   });
 
-  it('filters voice results down to available voices', () => {
+  it('includes only Inworld models in the supported set', () => {
+    assert.match(backgroundJs, /'inworld-tts-1\.5-max'/);
+    assert.match(backgroundJs, /'inworld-tts-1\.5-mini'/);
+    assert.doesNotMatch(backgroundJs, /eleven_flash|eleven_turbo|eleven_multilingual/);
+  });
+
+  it('filters voice results down to selectable voices', () => {
     assert.match(backgroundJs, /function isSelectableVoice\(voice\)/);
-    assert.match(backgroundJs, /voice && voice\.voice_id/);
-    assert.match(backgroundJs, /payload\.voices\s*\.filter\(isSelectableVoice\)/s);
+    assert.match(backgroundJs, /payload\.voices\.filter\(isSelectableVoice\)/s);
   });
 });
 
@@ -95,5 +101,13 @@ describe('AbortController timeout', () => {
     assert.match(backgroundJs, /AbortController/);
     assert.match(backgroundJs, /controller\.abort\(\)/);
     assert.match(backgroundJs, /signal:\s*controller\.signal/);
+  });
+});
+
+describe('ElevenLabs scrub', () => {
+  it('has no ElevenLabs references in background.js', () => {
+    assert.doesNotMatch(backgroundJs, /elevenlabs/i);
+    assert.doesNotMatch(backgroundJs, /xi-api-key/);
+    assert.doesNotMatch(backgroundJs, /\belApiKey\b/);
   });
 });

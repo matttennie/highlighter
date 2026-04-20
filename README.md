@@ -6,8 +6,8 @@
 
 - **Highlight Mode:** Brush-style cursor for intuitive text selection.
 - **Floating Transport:** Play, pause, skip, and adjust settings from a draggable in-page player.
-- **TTS Integration:** High-quality speech via ElevenLabs (v2.5 Flash/Turbo).
-- **Voice Management:** Dynamic voice filtering and selection.
+- **TTS Integration:** High-quality speech via Inworld AI (TTS 1.5 Max/Mini).
+- **Voice Management:** Dynamic voice list fetched from the Inworld API.
 - **Robustness:** Built-in fallbacks to browser `speechSynthesis` when API limits are hit or CSP blocks external audio.
 
 ## Stability & Robustness
@@ -33,7 +33,7 @@ npm install
 - Click `Load unpacked`
 - Select this folder
 
-3. Open the extension popup and paste an ElevenLabs API key.
+3. Open the extension popup and paste an Inworld API key.
 
 ## Usage
 
@@ -52,7 +52,7 @@ npm test
 - End-to-end extension check with Playwright:
 
 ```bash
-ELEVENLABS_API_KEY=your_key node tests/playwright-extension-check.mjs
+INWORLD_API_KEY=your_key node tests/playwright-extension-check.mjs
 ```
 
 ## License

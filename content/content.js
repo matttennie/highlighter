@@ -10,14 +10,21 @@
   window.__highlighterTtsContentLoaded = true;
 
   // ── Constants ──────────────────────────────────────────────────────
-  const DEFAULT_VOICE_ID = 'JBFqnCBsd6RMkjVDRZzb';
+  const DEFAULT_VOICE_ID = 'Ashley';
   const CURSOR_SIZE      = 22;
   const LINE_TOLERANCE   = 14;  // for END line detection (confirmed working)
-  const SPEEDS           = [0.7, 0.75, 0.9, 1.0, 1.1, 1.2];
+  // Full Inworld API range; server rejects anything outside [0.5, 1.5].
+  // 21 detents in 0.05 increments. Math.round avoids float-arithmetic drift
+  // (0.5 + 14*0.05 !== 1.2 in IEEE 754) that would break SPEEDS.indexOf checks.
+  const SPEEDS = Array.from({ length: 21 }, (_, i) => Math.round((0.5 + i * 0.05) * 100) / 100);
+  const SPEED_DEFAULT_INDEX = SPEEDS.indexOf(1.0); // 10
   const TTS_TIMEOUT_MS   = 35000; // FIX 7: response timeout
   const AUDIO_START_TIMEOUT_MS = 8000;
   const BASE64_CHUNK_SIZE = 8192;
   const LOG_PREFIX       = '[Highlighter TTS]';
+  const PREFETCH_LOOKAHEAD = 1;     // sentences after the currently-playing one
+  const SKIP_DEBOUNCE_MS = 250;     // collapse rapid skip taps into one synth call
+  const AUDIO_CACHE_LIMIT = 12;     // LRU bound on cached sentence audio
 
   // ── State ──────────────────────────────────────────────────────────
   let highlightMode = false;
@@ -42,6 +49,15 @@
   let pbRequestId   = 0;      // monotonic counter to discard stale TTS responses
   let cachedVoice   = DEFAULT_VOICE_ID; // FIX 8: use constant
   let cachedSpeed   = 1.0;
+
+  // ── Audio cache + prefetch ────────────────────────────────────────
+  // Per-sentence cache so skip-back / pre-fetched-N+1 don't burn extra synth calls.
+  // Insertion-ordered Map gives us cheap LRU when we delete the oldest entry on overflow.
+  const audioCache = new Map();      // sentenceIdx → { audioDataUrl, voice, speed }
+  const pendingPrefetch = new Map(); // sentenceIdx → { token: { cancelled } }
+  let prefetchGeneration = 0;        // bumped on voice/speed change to drop stale results
+  let skipDebounceTimer = 0;
+  let pendingSkipTarget = -1;
 
   function logDebug(event, details = {}) {
     const payload = {
@@ -333,6 +349,9 @@
       // Store sentences for playback navigation
       pbSentences = selected;
       pbIndex     = 0;
+      // New stroke = entirely different sentence array; old cache is meaningless.
+      cancelSkipDebounce();
+      invalidateAudioCache('new-stroke');
 
       showPlayer();
     } catch (e) {
@@ -557,7 +576,7 @@
       <div class="hltr-menu-row">
         <label class="hltr-menu-label">Speed</label>
         <div class="hltr-speed-row">
-          <input type="range" class="hltr-speed-slider" min="0" max="5" step="1" value="2">
+          <input type="range" class="hltr-speed-slider" min="0" max="${SPEEDS.length - 1}" step="1" value="${SPEED_DEFAULT_INDEX}">
           <span class="hltr-speed-label">1.0x</span>
         </div>
       </div>
@@ -579,11 +598,12 @@
         if (voiceSelect) voiceSelect.value = data.defaultVoice;
       }
       if (data.defaultSpeed) {
-        const idx = SPEEDS.indexOf(parseFloat(data.defaultSpeed));
-        if (idx !== -1) {
+        // Snap any saved value (legacy or current) to the nearest 0.05 detent.
+        const saved = parseFloat(data.defaultSpeed);
+        if (Number.isFinite(saved)) {
+          const idx = nearestSpeedIndex(saved);
           menuPanelEl.querySelector('.hltr-speed-slider').value = idx;
-          menuPanelEl.querySelector('.hltr-speed-label').textContent =
-            parseFloat(data.defaultSpeed) + 'x';
+          menuPanelEl.querySelector('.hltr-speed-label').textContent = formatSpeedLabel(SPEEDS[idx]);
         }
       }
     });
@@ -620,8 +640,9 @@
     const speedLbl = menuPanelEl.querySelector('.hltr-speed-label');
     slider.addEventListener('input', () => {
       const speed = SPEEDS[parseInt(slider.value)];
+      if (speed !== cachedSpeed) invalidateAudioCache('speed-changed');
       cachedSpeed = speed;
-      speedLbl.textContent = speed + 'x';
+      speedLbl.textContent = formatSpeedLabel(speed);
       chrome.storage.local.set({ defaultSpeed: speed.toString() }, () => {
         const storageError = chrome.runtime.lastError?.message || null;
         if (storageError) logDebug('speed-save-failed', { error: storageError });
@@ -630,6 +651,7 @@
 
     // Voice select
     menuPanelEl.querySelector('.hltr-voice-select').addEventListener('change', (e) => {
+      if (e.target.value !== cachedVoice) invalidateAudioCache('voice-changed');
       cachedVoice = e.target.value;
       chrome.storage.local.set({ defaultVoice: e.target.value }, () => {
         const storageError = chrome.runtime.lastError?.message || null;
@@ -692,6 +714,8 @@
     if (!playerEl) return;
     logDebug('player-hidden');
     stopPlayback();
+    cancelSkipDebounce();
+    invalidateAudioCache('player-hidden');
     playerEl.classList.remove('hltr-visible');
     closeMenu();
     pbSentences = [];
@@ -779,12 +803,136 @@
     if (!pbSentences.length) return;
     const newIdx = Math.max(0, Math.min(pbSentences.length - 1, pbIndex + delta));
     if (newIdx === pbIndex) return;
-    // If actively playing, play the new sentence; otherwise just highlight
-    if (pbState === 'playing' || pbState === 'loading') {
+
+    // Visual feedback is immediate even if audio waits for debounce.
+    pbIndex = newIdx;
+    highlightSentence(newIdx);
+
+    // Don't trigger playback unless we were already in an active session.
+    if (pbState !== 'playing' && pbState !== 'loading') return;
+
+    const voice = currentVoiceForPlayback();
+    const speed = currentSpeedForPlayback();
+
+    // Cache hit → play immediately, no debounce gap.
+    if (getCachedAudio(newIdx, voice, speed)) {
+      cancelSkipDebounce();
       playSentence(newIdx);
-    } else {
-      pbIndex = newIdx;
-      highlightSentence(newIdx);
+      return;
+    }
+
+    // Cache miss → debounce so rapid skips only fire one synth call (the destination).
+    releaseCurrentAudioElement();
+    if (window.speechSynthesis) window.speechSynthesis.cancel();
+    pbRequestId++; // invalidate any in-flight playback request
+    setPlaybackState('loading');
+
+    pendingSkipTarget = newIdx;
+    if (skipDebounceTimer) clearTimeout(skipDebounceTimer);
+    skipDebounceTimer = setTimeout(() => {
+      skipDebounceTimer = 0;
+      // If user kept skipping past this target, abandon this firing.
+      if (pendingSkipTarget !== pbIndex) return;
+      pendingSkipTarget = -1;
+      logDebug('skip-settled', { idx: pbIndex });
+      playSentence(pbIndex);
+    }, SKIP_DEBOUNCE_MS);
+  }
+
+  function cancelSkipDebounce() {
+    if (skipDebounceTimer) {
+      clearTimeout(skipDebounceTimer);
+      skipDebounceTimer = 0;
+    }
+    pendingSkipTarget = -1;
+  }
+
+  // ── Cache helpers ─────────────────────────────────────────────────
+  function getCachedAudio(idx, voice, speed) {
+    const entry = audioCache.get(idx);
+    if (!entry) return null;
+    if (entry.voice !== voice || entry.speed !== speed) return null;
+    // Re-insert to mark as most-recently-used.
+    audioCache.delete(idx);
+    audioCache.set(idx, entry);
+    return entry.audioDataUrl;
+  }
+
+  function setCachedAudio(idx, voice, speed, audioDataUrl) {
+    if (!audioDataUrl) return;
+    audioCache.set(idx, { audioDataUrl, voice, speed });
+    while (audioCache.size > AUDIO_CACHE_LIMIT) {
+      const oldestKey = audioCache.keys().next().value;
+      audioCache.delete(oldestKey);
+    }
+  }
+
+  function invalidateAudioCache(reason) {
+    if (audioCache.size === 0 && pendingPrefetch.size === 0) return;
+    logDebug('audio-cache-invalidated', { reason, cached: audioCache.size, pending: pendingPrefetch.size });
+    audioCache.clear();
+    cancelAllPrefetches();
+  }
+
+  function cancelAllPrefetches() {
+    prefetchGeneration++; // any in-flight prefetch responses will check this and discard
+    pendingPrefetch.clear();
+  }
+
+  function currentVoiceForPlayback() {
+    return menuPanelEl
+      ? (menuPanelEl.querySelector('.hltr-voice-select')?.value || cachedVoice)
+      : cachedVoice;
+  }
+
+  function currentSpeedForPlayback() {
+    const slider = menuPanelEl ? menuPanelEl.querySelector('.hltr-speed-slider') : null;
+    if (!slider) return cachedSpeed;
+    const idx = parseInt(slider.value, 10);
+    return SPEEDS[idx] ?? cachedSpeed;
+  }
+
+  function prefetchSentence(idx, voice, speed) {
+    if (idx < 0 || idx >= pbSentences.length) return;
+    if (audioCache.has(idx)) return;
+    if (pendingPrefetch.has(idx)) return;
+    if (!pbSentences[idx] || !pbSentences[idx].text) return;
+
+    const myGen = prefetchGeneration;
+    const token = { cancelled: false };
+    pendingPrefetch.set(idx, token);
+
+    const text = pbSentences[idx].text;
+    const startedAt = performance.now();
+    logDebug('prefetch-start', { idx, voice, speed, textLength: text.length });
+
+    chrome.runtime.sendMessage(
+      { type: 'tts-request', text, voice, speed },
+      (response) => {
+        pendingPrefetch.delete(idx);
+        const elapsedMs = Math.round(performance.now() - startedAt);
+        if (token.cancelled || myGen !== prefetchGeneration) {
+          logDebug('prefetch-discarded', { idx, elapsedMs, reason: token.cancelled ? 'cancelled' : 'stale-gen' });
+          return;
+        }
+        if (chrome.runtime.lastError || !response?.ok || !response.audioDataUrl) {
+          logDebug('prefetch-failed', {
+            idx,
+            elapsedMs,
+            error: response?.error || chrome.runtime.lastError?.message || 'no-response',
+            status: response?.status || null,
+          });
+          return;
+        }
+        setCachedAudio(idx, voice, speed, response.audioDataUrl);
+        logDebug('prefetch-cached', { idx, elapsedMs, audioBase64Length: response.audioDataUrl.length });
+      }
+    );
+  }
+
+  function maybePrefetchAhead(currentIdx, voice, speed) {
+    for (let off = 1; off <= PREFETCH_LOOKAHEAD; off++) {
+      prefetchSentence(currentIdx + off, voice, speed);
     }
   }
 
@@ -875,6 +1023,7 @@
       return;
     }
 
+    cancelSkipDebounce();
     pbIndex = idx;
     highlightSentence(idx);
     setPlaybackState('loading');
@@ -882,16 +1031,19 @@
     const requestId = ++pbRequestId;
 
     // Read current voice/speed from the in-page menu controls
-    const voice = menuPanelEl
-      ? (menuPanelEl.querySelector('.hltr-voice-select')?.value || cachedVoice)
-      : cachedVoice;
-    const speedSlider = menuPanelEl
-      ? menuPanelEl.querySelector('.hltr-speed-slider')
-      : null;
-    const speed = speedSlider
-      ? (SPEEDS[parseInt(speedSlider.value)] || cachedSpeed)
-      : cachedSpeed;
+    const voice = currentVoiceForPlayback();
+    const speed = currentSpeedForPlayback();
     const text = pbSentences[idx].text;
+
+    // Cache hit → skip the network roundtrip entirely.
+    const cachedUrl = getCachedAudio(idx, voice, speed);
+    if (cachedUrl) {
+      logDebug('tts-cache-hit', { idx, voice, speed });
+      playAudioDataUrl(cachedUrl, requestId, speed, text);
+      maybePrefetchAhead(idx, voice, speed);
+      return;
+    }
+
     logDebug('tts-request-start', {
       idx,
       voice,
@@ -934,22 +1086,29 @@
             runtimeError: chrome.runtime.lastError?.message || null,
             response,
           });
-          const errMsg = chrome.runtime.lastError
-            ? 'Extension error: ' + chrome.runtime.lastError.message
+          const runtimeError = chrome.runtime.lastError?.message || null;
+          const errMsg = runtimeError
+            ? 'Extension error: ' + runtimeError
             : getErrorMessage(response);
+          const details = buildErrorDetails(response, {
+            voice, speed, requestId, runtimeError,
+          });
           console.warn(LOG_PREFIX, errMsg, '— falling back to speechSynthesis');
-          showPlayerWarning(errMsg);
+          showPlayerWarning(errMsg, details);
           fallbackSpeechSynthesis(text, speed, requestId);
           return;
         }
 
         // FIX 4: Validate audioDataUrl before attempting playback
         if (!response.audioDataUrl) {
-          showPlayerError('Empty audio response');
+          showPlayerError('Empty audio response', buildErrorDetails(response, { voice, speed, requestId }));
           return;
         }
 
+        // Stash for skip-back / replay; no extra round-trip if we revisit.
+        setCachedAudio(idx, voice, speed, response.audioDataUrl);
         playAudioDataUrl(response.audioDataUrl, requestId, speed, text);
+        maybePrefetchAhead(idx, voice, speed);
       }
     );
   }
@@ -976,11 +1135,12 @@
   function playAudioDataUrl(dataUrl, requestId, speed, text) {
     // FIX 1: Capture requestId in closure so the ended handler can check staleness
     const capturedId = requestId;
-    const playbackRate = normalizePlaybackRate(speed);
     const audioUrl = audioDataUrlToObjectUrl(dataUrl) || dataUrl;
     pbAudioObjectUrl = audioUrl.startsWith('blob:') ? audioUrl : null;
     pbAudio = new Audio(audioUrl);
-    pbAudio.playbackRate = playbackRate;
+    // Speed is applied server-side via audioConfig.speakingRate; double-applying
+    // playbackRate here would compound the rate and degrade pitch.
+    pbAudio.playbackRate = 1.0;
 
     let started = false;
     let usingFallback = false;
@@ -1033,15 +1193,21 @@
       if (capturedId !== pbRequestId || usingFallback) return;
       usingFallback = true;
       clearTimeout(audioStartTimeout);
+      const errCode = pbAudio?.error?.code ?? null;
+      const errMessage = pbAudio?.error?.message || null;
       logDebug('audio-error', {
         requestId: capturedId,
-        code: pbAudio?.error?.code || null,
-        message: pbAudio?.error?.message || null,
+        code: errCode,
+        message: errMessage,
         readyState: pbAudio?.readyState ?? null,
+        srcKind: pbAudioObjectUrl ? 'blob' : 'data',
       });
-      // GitHub/strict sites block data/blob audio via CSP.
-      // We log this but don't warn alarms, as the fallback is intended.
-      showPlayerWarning('Site security restricted audio; using system voice');
+      // Surface diagnostics so we can tell a CSP block apart from a malformed payload.
+      const details = buildErrorDetails(
+        { error: 'audio-element-error', detail: errMessage || `MediaError code ${errCode}` },
+        { voice: cachedVoice, speed, requestId: capturedId, audioErrorCode: errCode, srcKind: pbAudioObjectUrl ? 'blob' : 'data' }
+      );
+      showPlayerWarning('Site security restricted audio; using system voice', details);
       releaseCurrentAudioElement();
       fallbackSpeechSynthesis(text, speed, capturedId);
     }, { once: true });
@@ -1064,7 +1230,11 @@
           name: err?.name || null,
         });
         // FIX 5: Also fall back on play() promise rejection (another CSP vector)
-        showPlayerWarning('Playback restricted; using system voice');
+        const details = buildErrorDetails(
+          { error: 'audio-play-rejected', detail: err?.message || String(err) },
+          { voice: cachedVoice, speed, requestId: capturedId, errorName: err?.name || null }
+        );
+        showPlayerWarning('Playback restricted; using system voice', details);
         releaseCurrentAudioElement();
         fallbackSpeechSynthesis(text, speed, capturedId);
       });
@@ -1161,15 +1331,14 @@
   function getErrorMessage(response) {
     if (!response) return 'No response from background';
     switch (response.error) {
-      case 'no-token':          return 'Set ElevenLabs API key in extension settings';
-      case 'unsupported-provider': return response.detail || 'Use an ElevenLabs API key';
+      case 'no-token':          return 'Set Inworld API key in extension settings';
       case 'empty-text':        return 'Select some text before playing';
       case 'auth-failed':       return response.detail
         ? `Authentication failed\n${truncateDetail(response.detail)}`
         : 'Invalid API key';
       case 'billing-required':  return response.detail
         ? `API error (402)\n${truncateDetail(response.detail)}`
-        : 'API error (402)\nCheck ElevenLabs billing/quota';
+        : 'API error (402)\nCheck Inworld billing/quota';
       case 'rate-limited':      return 'Rate limited — try again shortly';
       case 'text-too-long':     return response.detail
         ? `Text too long\n${truncateDetail(response.detail)}`
@@ -1185,7 +1354,25 @@
   function normalizePlaybackRate(speed) {
     const parsed = parseFloat(speed);
     if (!Number.isFinite(parsed)) return 1.0;
-    return Math.max(0.7, Math.min(1.2, parsed));
+    return Math.max(0.5, Math.min(1.5, parsed));
+  }
+
+  function nearestSpeedIndex(speed) {
+    const clamped = Math.max(SPEEDS[0], Math.min(SPEEDS[SPEEDS.length - 1], speed));
+    let bestIdx = SPEED_DEFAULT_INDEX;
+    let bestDelta = Infinity;
+    for (let i = 0; i < SPEEDS.length; i++) {
+      const d = Math.abs(SPEEDS[i] - clamped);
+      if (d < bestDelta) { bestDelta = d; bestIdx = i; }
+    }
+    return bestIdx;
+  }
+
+  // Show 1 decimal for round-tenth values (1.0x, 1.5x), 2 decimals for fine ones (1.05x).
+  function formatSpeedLabel(speed) {
+    const tenths = speed * 10;
+    const isTenth = Math.abs(tenths - Math.round(tenths)) < 1e-9;
+    return (isTenth ? speed.toFixed(1) : speed.toFixed(2)) + 'x';
   }
 
   function ensureVoiceOption(selectEl, voiceId, label) {
@@ -1254,31 +1441,120 @@
     return text.length > 140 ? text.slice(0, 137) + '...' : text;
   }
 
-  function showPlayerError(msg) {
+  function buildErrorDetails(response, ctx = {}) {
+    const lines = [];
+    if (ctx.voice) lines.push(`Voice: ${ctx.voice}`);
+    if (ctx.speed !== undefined && ctx.speed !== null) lines.push(`Speed: ${ctx.speed}`);
+    if (ctx.requestId !== undefined) lines.push(`Request: #${ctx.requestId}`);
+    if (response?.status) lines.push(`HTTP status: ${response.status}`);
+    if (response?.error) lines.push(`Error code: ${response.error}`);
+    if (response?.detail) lines.push(`Detail: ${response.detail}`);
+    if (ctx.audioErrorCode !== undefined && ctx.audioErrorCode !== null) {
+      lines.push(`Audio MediaError code: ${ctx.audioErrorCode}`);
+    }
+    if (ctx.srcKind) lines.push(`Audio src kind: ${ctx.srcKind}`);
+    if (ctx.errorName) lines.push(`Error name: ${ctx.errorName}`);
+    if (ctx.runtimeError) lines.push(`Runtime error: ${ctx.runtimeError}`);
+    lines.push(`Page: ${location.href}`);
+    lines.push(`Time: ${new Date().toISOString()}`);
+    lines.push(`UA: ${navigator.userAgent}`);
+    return lines.join('\n');
+  }
+
+  function showPlayerError(msg, details) {
     setPlaybackState('error');
-    console.warn(LOG_PREFIX, msg);
-    showToast(msg, true);
+    console.warn(LOG_PREFIX, msg, details || '');
+    showToast(msg, true, details);
     setTimeout(() => {
       if (pbState === 'error') setPlaybackState('idle');
     }, 4000);
   }
 
   // Flash error tooltip without blocking playback (used before fallback)
-  function showPlayerWarning(msg) {
-    showToast(msg, false);
+  function showPlayerWarning(msg, details) {
+    showToast(msg, false, details);
   }
 
-  function showToast(msg, isError) {
+  function showToast(msg, isError, details) {
     if (!toastEl) return;
     clearTimeout(toastTimer);
-    toastEl.textContent = msg;
+    toastEl.replaceChildren();
+
+    const msgEl = document.createElement('div');
+    msgEl.className = 'hltr-toast-msg';
+    msgEl.textContent = msg;
+    toastEl.appendChild(msgEl);
+
+    if (details) {
+      const pre = document.createElement('pre');
+      pre.className = 'hltr-toast-details';
+      pre.textContent = details;
+      toastEl.appendChild(pre);
+
+      const actions = document.createElement('div');
+      actions.className = 'hltr-toast-actions';
+
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'hltr-toast-copy';
+      copyBtn.textContent = 'Copy';
+      copyBtn.addEventListener('click', async (ev) => {
+        ev.stopPropagation();
+        const payload = `${msg}\n\n${details}`;
+        try {
+          await navigator.clipboard.writeText(payload);
+          copyBtn.textContent = 'Copied';
+        } catch {
+          // Some sites block clipboard writes. Fall back to a selectable textarea.
+          const ta = document.createElement('textarea');
+          ta.value = payload;
+          ta.style.position = 'fixed';
+          ta.style.top = '-1000px';
+          document.documentElement.appendChild(ta);
+          ta.select();
+          try { document.execCommand('copy'); copyBtn.textContent = 'Copied'; }
+          catch { copyBtn.textContent = 'Copy failed'; }
+          ta.remove();
+        }
+        setTimeout(() => { copyBtn.textContent = 'Copy'; }, 2000);
+      });
+      actions.appendChild(copyBtn);
+
+      const dismissBtn = document.createElement('button');
+      dismissBtn.type = 'button';
+      dismissBtn.className = 'hltr-toast-dismiss';
+      dismissBtn.textContent = 'Dismiss';
+      dismissBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        clearTimeout(toastTimer);
+        toastTimer = 0;
+        toastEl.classList.remove('hltr-visible', 'hltr-error');
+      });
+      actions.appendChild(dismissBtn);
+
+      toastEl.appendChild(actions);
+    }
+
     toastEl.classList.toggle('hltr-visible', true);
     toastEl.classList.toggle('hltr-error', isError);
+    toastEl.classList.toggle('hltr-toast-detailed', Boolean(details));
     positionToast();
+
+    const dismissMs = details ? 15000 : 4000;
     toastTimer = setTimeout(() => {
-      toastEl.classList.remove('hltr-visible', 'hltr-error');
+      toastEl.classList.remove('hltr-visible', 'hltr-error', 'hltr-toast-detailed');
       toastTimer = 0;
-    }, 4000);
+    }, dismissMs);
+
+    // Pause auto-dismiss while the user reads/interacts.
+    toastEl.onmouseenter = () => { if (toastTimer) { clearTimeout(toastTimer); toastTimer = 0; } };
+    toastEl.onmouseleave = () => {
+      if (!toastEl.classList.contains('hltr-visible')) return;
+      toastTimer = setTimeout(() => {
+        toastEl.classList.remove('hltr-visible', 'hltr-error', 'hltr-toast-detailed');
+        toastTimer = 0;
+      }, 4000);
+    };
   }
 
   function positionToast() {

@@ -146,40 +146,30 @@
   <h1>Highlighter TTS</h1>
 
   <div class="field">
-    <label for="apiToken">ElevenLabs API Key</label>
-    <input type="password" id="apiToken" placeholder="sk_...">
-    <div class="hint" id="providerHint">Enter an ElevenLabs key that starts with sk_.</div>
-  </div>
-
-  <div class="field">
     <label for="inworldApiToken">Inworld API Key</label>
     <input type="password" id="inworldApiToken" placeholder="Enter Inworld key...">
-    <div class="hint">Your Inworld key for more affordable TTS.</div>
+    <div class="hint" id="providerHint">Your Inworld API key for high-quality TTS.</div>
   </div>
 
   <div class="field">
     <label for="modelId">TTS Model</label>
     <select id="modelId">
+      <option value="inworld-tts-1.5-max">Max (High Quality)</option>
+      <option value="inworld-tts-1.5-mini">Mini (Fast &amp; Efficient)</option>
     </select>
-    <div class="hint" id="modelHint">Model options for ElevenLabs.</div>
+    <div class="hint" id="modelHint">Model options for Inworld AI.</div>
   </div>
 
   <div class="field">
     <label for="defaultVoice">Default Voice</label>
     <select id="defaultVoice"></select>
-    <div class="hint" id="voiceHint">The dropdown shows API-returned ElevenLabs voices when available; otherwise it falls back to the configured voice.</div>
+    <div class="hint" id="voiceHint">Dropdown shows voices returned by the Inworld API.</div>
   </div>
 
   <div class="field">
     <label for="defaultSpeed">Default Speed</label>
-    <select id="defaultSpeed">
-      <option value="0.7">0.7x</option>
-      <option value="0.75">0.75x</option>
-      <option value="0.9">0.9x</option>
-      <option value="1" selected>1.0x</option>
-      <option value="1.1">1.1x</option>
-      <option value="1.2">1.2x</option>
-    </select>
+    <input type="number" id="defaultSpeed" min="0.5" max="1.5" step="0.05" value="1.0">
+    <div class="hint">0.5x – 1.5x in 0.05 increments. Server-side speakingRate.</div>
   </div>
 
   <div class="toggle-row">
@@ -193,6 +183,7 @@
   <div class="status" id="status"></div>
 
   <div class="debug-actions">
+    <button type="button" id="testApiBtn">Test Inworld API</button>
     <button type="button" id="copyDebugLog">Copy Debug Log</button>
     <button type="button" id="clearDebugLog">Clear Log</button>
   </div>
