@@ -451,12 +451,15 @@
     if (!text.trim()) return [];
 
     const results    = [];
-    const sentenceRe = /[^!.?…]*(?:[!.?…]+['"'"]?\s*)/g;
+    // `.` is a terminator EXCEPT when it sits between two digits — that keeps
+    // version numbers (3.1.56), decimals (3.14), IPs, and currency intact.
+    const sentenceRe = /[^!?…]*?(?:[!?…]+|\.(?!\d)|(?<!\d)\.)+["'”’]?\s*/g;
     let match, consumed = 0;
 
     while ((match = sentenceRe.exec(text)) !== null) {
       const raw = match[0];
-      if (!raw.trim()) { consumed = match.index + raw.length; continue; }
+      const trimmed = stripLeadingNoise(raw.trim());
+      if (!hasReadableContent(trimmed)) { consumed = match.index + raw.length; continue; }
       const charStart = match.index;
       const charEnd   = match.index + raw.length;
       consumed = charEnd;
@@ -467,15 +470,17 @@
       if (!rects.length) continue;
 
       results.push({
-        text: raw.trim(),
+        text: trimmed,
         range,
         startLineY: rects[0].top,
         endLineY:   rects[rects.length - 1].top,
       });
     }
 
-    const tail = text.slice(consumed).trim();
-    if (tail) {
+    const tail = stripLeadingNoise(text.slice(consumed).trim());
+    // Skip pure-punctuation tails (e.g. ":)" left after a paragraph) — TTS
+    // engines either error or pronounce them literally ("colon close-paren").
+    if (hasReadableContent(tail)) {
       const range = charOffsetsToRange(el, consumed, text.length);
       if (range) {
         const rects = range.getClientRects();
@@ -491,6 +496,19 @@
     }
 
     return results;
+  }
+
+  // True when the string contains at least one letter or digit. Used to drop
+  // punctuation-only "sentences" before they reach the TTS engine.
+  function hasReadableContent(text) {
+    return /[\p{L}\p{N}]/u.test(text);
+  }
+
+  // Strip leading non-word noise (smileys like ":)", em-dashes, arrows, stray
+  // punctuation that survived a paragraph break) but preserve opening quotes
+  // and parens so quoted/parenthetical sentences still read naturally.
+  function stripLeadingNoise(text) {
+    return text.replace(/^[^\p{L}\p{N}"'(\[«„“‘]+/u, '');
   }
 
   function charOffsetsToRange(container, charStart, charEnd) {
