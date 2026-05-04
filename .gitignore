@@ -4,6 +4,7 @@ node_modules/
 *.pem
 .fwens/
 .claude/
+.worktrees/
 /tmp/
 playwright-report/
 test-results/
