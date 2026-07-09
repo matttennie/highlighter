@@ -8,3 +8,5 @@ node_modules/
 /tmp/
 playwright-report/
 test-results/
+offscreen/tts-engine.bundle.js
+offscreen/ort/

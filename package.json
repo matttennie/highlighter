@@ -1,10 +1,11 @@
 {
   "name": "highlighter-tts",
-  "version": "0.1.31",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "Chrome extension: select text with a paint-brush stroke and hear it read aloud via Inworld AI TTS",
+  "description": "Chrome extension: select text with a paint-brush stroke and hear it read aloud with on-device Kokoro AI voices",
   "scripts": {
+    "build": "node scripts/build.mjs",
     "test": "node --test tests/*.js",
     "test:extension:verbose": "node tests/playwright-extension-check.mjs",
     "test:extension:playback": "node tests/playwright-playback-flow.mjs",
@@ -12,6 +13,8 @@
     "watch:extension": "node tests/watch-extension.mjs"
   },
   "devDependencies": {
+    "esbuild": "^0.25.0",
+    "kokoro-js": "^1.2.1",
     "playwright": "^1.59.1"
   }
 }
