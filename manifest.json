@@ -1,21 +1,22 @@
 {
   "manifest_version": 3,
   "name": "Highlighter TTS",
-  "version": "0.1.31",
-  "description": "Select text with a paint-brush stroke and hear it read aloud via Inworld AI TTS",
-  "minimum_chrome_version": "102",
+  "version": "0.2.0",
+  "description": "Select text with a paint-brush stroke and hear it read aloud with private, on-device Kokoro AI voices",
+  "minimum_chrome_version": "116",
   "permissions": [
     "activeTab",
     "storage",
     "contextMenus",
-    "scripting"
-  ],
-  "host_permissions": [
-    "<all_urls>",
-    "https://api.inworld.ai/*"
+    "scripting",
+    "offscreen",
+    "unlimitedStorage"
   ],
   "background": {
     "service_worker": "background.js"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
   },
   "action": {
     "default_popup": "popup/popup.html",
@@ -25,13 +26,6 @@
       "128": "icons/icon128.png"
     }
   },
-  "content_scripts": [
-    {
-      "matches": ["<all_urls>"],
-      "js": ["content/content.js"],
-      "css": ["content/content.css"]
-    }
-  ],
   "commands": {
     "toggle-highlight-mode": {
       "suggested_key": {
