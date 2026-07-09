@@ -49,7 +49,8 @@ describe('offscreen routing', () => {
     assert.doesNotMatch(backgroundJs, /elevenlabs/i);
     assert.doesNotMatch(backgroundJs, /apiKey/);
     assert.doesNotMatch(backgroundJs, /Authorization/);
-    assert.doesNotMatch(backgroundJs, /fetch\(/);
+    // fetch() now exists solely for the loopback native Kokoro server.
+    assert.doesNotMatch(backgroundJs, /fetch\((?!`\$\{NATIVE_BASE_URL\})/);
   });
 
   it('uses the Kokoro default voice', () => {
@@ -63,7 +64,7 @@ describe('offscreen routing', () => {
   });
 
   it('pre-warms the engine when the user toggles highlight mode', () => {
-    assert.match(backgroundJs, /function sendToggle\([\s\S]{0,200}?void ensureOffscreenDocument\(\)/);
+    assert.match(backgroundJs, /function sendToggle\([\s\S]{0,200}?void preWarmEngine\(\)/);
   });
 });
 
@@ -136,5 +137,68 @@ describe('text length validation', () => {
   it('enforces the 2000-character per-request cap', () => {
     assert.match(backgroundJs, /MAX_TEXT_LENGTH\s*=\s*2000/);
     assert.match(backgroundJs, /normalizedText\.length > MAX_TEXT_LENGTH/);
+  });
+});
+
+describe('native-first routing', () => {
+  it('defines the native companion server constants', () => {
+    assert.match(backgroundJs, /const NATIVE_BASE_URL = 'http:\/\/127\.0\.0\.1:8880';/);
+    assert.match(backgroundJs, /const NATIVE_HEALTH_TIMEOUT_MS = 600;/);
+    assert.match(backgroundJs, /const NATIVE_TTS_TIMEOUT_MS = 30000;/);
+    assert.match(backgroundJs, /const NATIVE_RECHECK_MS = 30000;/);
+  });
+
+  it('caches native availability and probes /health with an abortable fetch', () => {
+    assert.match(backgroundJs, /async function isNativeAvailable\(\)/);
+    assert.match(backgroundJs, /fetch\(`\$\{NATIVE_BASE_URL\}\/health`, \{ signal: controller\.signal \}\)/);
+    assert.match(backgroundJs, /now - nativeState\.checkedAt < NATIVE_RECHECK_MS/);
+  });
+
+  it('marks native down on failure so callers fall back to offscreen', () => {
+    assert.match(backgroundJs, /function markNativeDown\(\)/);
+    assert.match(backgroundJs, /nativeState = \{ available: false, checkedAt: Date\.now\(\) \}/);
+  });
+
+  it('routes tts-request to native /tts first, falling back to offscreen on failure', () => {
+    assert.match(backgroundJs, /fetch\(`\$\{NATIVE_BASE_URL\}\/tts`/);
+    assert.match(backgroundJs, /audioDataUrl: `data:audio\/wav;base64,\$\{payload\.audioContent\}`/);
+    // On native failure the handler must mark native down and log before falling through.
+    const ttsFn = backgroundJs.match(/async function handleTtsRequest\([\s\S]*?\n}\n/);
+    assert.ok(ttsFn, 'handleTtsRequest not found');
+    assert.match(ttsFn[0], /isNativeAvailable\(\)/);
+    assert.match(ttsFn[0], /markNativeDown\(\)/);
+    assert.match(ttsFn[0], /native-tts-failed/);
+    assert.match(ttsFn[0], /ensureOffscreenDocument\(\)/);
+    assert.match(ttsFn[0], /sendToOffscreen\(\{/);
+  });
+
+  it('routes voices-request to native /voices first, falling back to offscreen', () => {
+    assert.match(backgroundJs, /fetch\(`\$\{NATIVE_BASE_URL\}\/voices`/);
+    const voicesFn = backgroundJs.match(/async function handleVoicesRequest\([\s\S]*?\n}\n/);
+    assert.ok(voicesFn, 'handleVoicesRequest not found');
+    assert.match(voicesFn[0], /isNativeAvailable\(\)/);
+    assert.match(voicesFn[0], /ok: true, voices: payload\.voices/);
+    assert.match(voicesFn[0], /ensureOffscreenDocument\(\)/);
+  });
+
+  it('reports the native backend immediately for engine-status without touching offscreen', () => {
+    const statusFn = backgroundJs.match(/async function handleEngineStatusRequest\([\s\S]*?\n}\n/);
+    assert.ok(statusFn, 'handleEngineStatusRequest not found');
+    assert.match(statusFn[0], /status: 'ready', backend: 'native', progress: 100, warm: true/);
+    // The native branch must return before any offscreen call.
+    const nativeBranch = statusFn[0].split(/status: 'ready', backend: 'native'/)[0];
+    assert.doesNotMatch(nativeBranch, /ensureOffscreenDocument/);
+    assert.match(statusFn[0], /backend = 'wasm'/);
+  });
+
+  it('gates offscreen creation in preWarmEngine on native availability', () => {
+    const helper = backgroundJs.match(/async function preWarmEngine\(\)[\s\S]*?\n}\n/);
+    assert.ok(helper, 'preWarmEngine helper not found');
+    assert.match(helper[0], /isNativeAvailable\(\)/);
+    assert.match(helper[0], /ensureOffscreenDocument\(\)/);
+  });
+
+  it('leaves tts-cancel routing to the offscreen queue only (native synths are cheap to waste)', () => {
+    assert.match(backgroundJs, /native synths are ~1\.5s/i);
   });
 });

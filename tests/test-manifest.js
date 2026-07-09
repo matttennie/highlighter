@@ -18,10 +18,12 @@ describe('manifest.json', () => {
     assert.match(manifest.content_security_policy.extension_pages, /'wasm-unsafe-eval'/);
   });
 
-  it('carries no remote API host permissions and no static content scripts', () => {
-    assert.equal(manifest.host_permissions, undefined);
+  it('restricts host permissions to the local native companion server, with no content scripts', () => {
+    // Only the loopback native Kokoro server needs a host permission — never <all_urls>.
+    assert.deepEqual(manifest.host_permissions, ['http://127.0.0.1/*']);
     assert.equal(manifest.content_scripts, undefined);
     assert.doesNotMatch(JSON.stringify(manifest), /inworld/i);
+    assert.doesNotMatch(JSON.stringify(manifest), /<all_urls>/);
   });
 
   it('requires Chrome 116+ for chrome.runtime.getContexts', () => {

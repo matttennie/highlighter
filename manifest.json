@@ -4,6 +4,7 @@
   "version": "0.2.0",
   "description": "Select text with a paint-brush stroke and hear it read aloud with private, on-device Kokoro AI voices",
   "minimum_chrome_version": "116",
+  "host_permissions": ["http://127.0.0.1/*"],
   "permissions": [
     "activeTab",
     "storage",

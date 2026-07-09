@@ -201,11 +201,15 @@ function refreshEngineStatus() {
         scheduleEnginePoll();
         break;
       case 'ready':
-        // Device is always CPU now. Surface the WASM thread count — single-thread
-        // (no cross-origin isolation, hence no SharedArrayBuffer) is much slower.
-        engineStatusEl.textContent = resp.isolated === false
-          ? 'Ready — on-device (CPU, single-thread — slow)'
-          : `Ready — on-device (CPU, ${resp.threads || '?'} threads)`;
+        if (resp.backend === 'native') {
+          engineStatusEl.textContent = 'Ready — native Kokoro server';
+        } else {
+          // Device is always CPU now. Surface the WASM thread count — single-thread
+          // (no cross-origin isolation, hence no SharedArrayBuffer) is much slower.
+          engineStatusEl.textContent = resp.isolated === false
+            ? 'Ready — on-device (CPU, single-thread — slow)'
+            : `Ready — on-device (CPU, ${resp.threads || '?'} threads)`;
+        }
         if (!voicesLoadedFromEngine) loadVoices(voiceSelect.value || DEFAULT_VOICE_ID);
         break;
       case 'error':

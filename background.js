@@ -13,10 +13,19 @@ const OFFSCREEN_URL = 'offscreen/offscreen.html';
 const OFFSCREEN_SEND_RETRIES = 5;
 const OFFSCREEN_SEND_RETRY_DELAY_MS = 200;
 
+// Native companion server (server/kokoro_server.py) — loopback only, checked
+// first on every TTS/voices/status request. Falls back to the in-extension
+// WASM engine (offscreen document) whenever it's unavailable.
+const NATIVE_BASE_URL = 'http://127.0.0.1:8880';
+const NATIVE_HEALTH_TIMEOUT_MS = 600;
+const NATIVE_TTS_TIMEOUT_MS = 30000;
+const NATIVE_RECHECK_MS = 30000;
+
 let requestSeq = 0;
 let debugLogBuffer = [];
 let isFlushPending = false;
 let offscreenCreating = null;
+let nativeState = { available: null, checkedAt: 0 };
 
 function getStoredDefaultVoice() {
   return new Promise((resolve) => {
@@ -164,7 +173,7 @@ function injectContentScript(tabId, callback, url = '') {
 function sendToggle(tabId, url = '', retrying = false, done = () => {}) {
   // The user is engaging — start warming the voice engine now so the first
   // sentence doesn't wait for model load.
-  void ensureOffscreenDocument().catch(() => {});
+  void preWarmEngine().catch(() => {});
   if (!Number.isInteger(tabId)) {
     done({ ok: false, error: 'tab-not-found' });
     return;
@@ -220,6 +229,33 @@ chrome.commands.onCommand.addListener((command) => {
   if (command === 'toggle-highlight-mode') sendToggleToActiveTab();
 });
 
+// ── Native companion server ─────────────────────────────────────────
+// isNativeAvailable() caches its result for NATIVE_RECHECK_MS so the hot
+// tts-request/voices-request paths don't pay a health-check round trip on
+// every call. markNativeDown() lets a failed /tts or /voices call force an
+// immediate recheck instead of waiting out the cache window.
+async function isNativeAvailable() {
+  const now = Date.now();
+  if (nativeState.available !== null && now - nativeState.checkedAt < NATIVE_RECHECK_MS) {
+    return nativeState.available;
+  }
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), NATIVE_HEALTH_TIMEOUT_MS);
+    const res = await fetch(`${NATIVE_BASE_URL}/health`, { signal: controller.signal });
+    clearTimeout(timer);
+    nativeState = { available: res.ok, checkedAt: now };
+  } catch {
+    nativeState = { available: false, checkedAt: now };
+  }
+  if (nativeState.available) logDebug('native-server-available', {});
+  return nativeState.available;
+}
+
+function markNativeDown() {
+  nativeState = { available: false, checkedAt: Date.now() };
+}
+
 // ── Offscreen document management ───────────────────────────────────
 // The Kokoro model runs in an offscreen document (service workers can't
 // use WASM threads/WebGPU or keep the model warm). Created lazily on the
@@ -239,6 +275,14 @@ async function ensureOffscreenDocument() {
       });
   }
   await offscreenCreating;
+}
+
+// Fire-and-forget warmup on user engagement (sendToggle). When the native
+// server is up we deliberately skip loading the ~300MB WASM model at all —
+// that's the whole RAM win of having a native companion server.
+async function preWarmEngine() {
+  if (await isNativeAvailable()) return;
+  await ensureOffscreenDocument();
 }
 
 function sendToOffscreenOnce(message) {
@@ -331,6 +375,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const scopedIds = rawIds.map((id) => `${sender.tab?.id ?? 'x'}:${id}`);
     // Fire-and-forget. Never create the offscreen document just to cancel — if
     // it isn't running there is nothing queued to skip.
+    // Native synths are ~1.5s and untracked here — a superseded native /tts fetch
+    // just finishes and its result is discarded, which is cheap enough to accept.
     forwardCancelToOffscreen(scopedIds).catch(() => {});
     sendResponse({ ok: true });
     return false;
@@ -441,6 +487,41 @@ async function handleTtsRequest({ text, voice, speed }, requestId = ++requestSeq
     speed: normalizedSpeed,
   });
 
+  if (await isNativeAvailable()) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), NATIVE_TTS_TIMEOUT_MS);
+      let res;
+      try {
+        res = await fetch(`${NATIVE_BASE_URL}/tts`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: normalizedText, voice: voiceId, speed: normalizedSpeed }),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!res.ok) throw new Error(`native-http-${res.status}`);
+      const payload = await res.json();
+      if (!payload || typeof payload.audioContent !== 'string' || !payload.audioContent) {
+        throw new Error('native-bad-payload');
+      }
+      logDebug('tts-complete', {
+        requestId,
+        ok: true,
+        error: null,
+        backend: 'native',
+        elapsedMs: Math.round(performance.now() - startedAt),
+      });
+      return { ok: true, audioDataUrl: `data:audio/wav;base64,${payload.audioContent}` };
+    } catch (err) {
+      markNativeDown();
+      logDebug('native-tts-failed', { detail: err.message });
+      // Fall through to the offscreen (WASM) path below.
+    }
+  }
+
   await ensureOffscreenDocument();
   const response = (await sendToOffscreen({
     type: 'tts-request',
@@ -462,6 +543,29 @@ async function handleTtsRequest({ text, voice, speed }, requestId = ++requestSeq
 // ── Voices request handler ──────────────────────────────────────────
 async function handleVoicesRequest(requestId = ++requestSeq) {
   logDebug('voices-request-forwarded', { requestId });
+
+  if (await isNativeAvailable()) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), NATIVE_TTS_TIMEOUT_MS);
+      let res;
+      try {
+        res = await fetch(`${NATIVE_BASE_URL}/voices`, { signal: controller.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!res.ok) throw new Error(`native-http-${res.status}`);
+      const payload = await res.json();
+      if (!payload || !Array.isArray(payload.voices)) throw new Error('native-bad-payload');
+      logDebug('voices-parsed', { requestId, ok: true, count: payload.voices.length });
+      return { ok: true, voices: payload.voices };
+    } catch (err) {
+      markNativeDown();
+      logDebug('native-voices-failed', { detail: err.message });
+      // Fall through to the offscreen (WASM) path below.
+    }
+  }
+
   await ensureOffscreenDocument();
   const response = (await sendToOffscreen({ type: 'voices-request' })) || { ok: false, error: 'no-response' };
   logDebug('voices-parsed', { requestId, ok: Boolean(response.ok), count: response.voices?.length || 0 });
@@ -470,8 +574,13 @@ async function handleVoicesRequest(requestId = ++requestSeq) {
 
 // ── Engine status handler ───────────────────────────────────────────
 async function handleEngineStatusRequest() {
+  if (await isNativeAvailable()) {
+    return { ok: true, status: 'ready', backend: 'native', progress: 100, warm: true };
+  }
   await ensureOffscreenDocument();
-  return (await sendToOffscreen({ type: 'engine-status-request' })) || { ok: false, error: 'no-response' };
+  const response = (await sendToOffscreen({ type: 'engine-status-request' })) || { ok: false, error: 'no-response' };
+  if (response.ok) response.backend = 'wasm';
+  return response;
 }
 
 // Kokoro's ONNX graph accepts speeds in [0.5, 2.0].

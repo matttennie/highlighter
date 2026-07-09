@@ -85,6 +85,11 @@ describe('popup.js', () => {
     assert.match(popupJs, /resp\.warm/);
     assert.match(popupJs, /Waking up voice engine — \$\{resp\.progress \|\| 0\}%/);
   });
+
+  it('reports the native Kokoro server distinctly from the WASM engine', () => {
+    assert.match(popupJs, /resp\.backend === 'native'/);
+    assert.match(popupJs, /Ready — native Kokoro server/);
+  });
 });
 
 describe('snapSpeed (popup mirror)', () => {
