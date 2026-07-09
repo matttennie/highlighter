@@ -359,6 +359,33 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // Offscreen documents have no chrome.storage access — only runtime
+  // messaging. These two routes let the offscreen engine read/write the
+  // stored default voice and the loaded-once flag through the background.
+  if (msg.type === 'engine-boot-info-request') {
+    chrome.storage.local.get(['defaultVoice', 'kokoroLoadedOnce'], (data) => {
+      const error = chrome.runtime.lastError?.message || null;
+      if (error) {
+        sendResponse({ ok: false });
+        return;
+      }
+      sendResponse({
+        ok: true,
+        defaultVoice: typeof data.defaultVoice === 'string' ? data.defaultVoice : '',
+        loadedOnce: Boolean(data.kokoroLoadedOnce),
+      });
+    });
+    return true;
+  }
+
+  if (msg.type === 'engine-loaded-once') {
+    chrome.storage.local.set({ kokoroLoadedOnce: true }, () => {
+      void chrome.runtime.lastError;
+      sendResponse({ ok: true });
+    });
+    return true;
+  }
+
   if (msg.type === 'debug-log-request') {
     chrome.storage.local.get([DEBUG_LOG_KEY], (data) => {
       const error = chrome.runtime.lastError?.message || null;

@@ -75,32 +75,20 @@ function loadModel({ device, dtype }) {
   });
 }
 
-// Offscreen documents have chrome.storage access. Read the user's stored voice
-// so the warmup pays that voice's style-vector fetch, not the default voice's.
-function getStoredVoice() {
+// Offscreen documents have no access to extension storage — ask the
+// background. Bundles the stored default voice (for warmup) and the
+// loaded-once flag (for the "waking up" vs "downloading" status label)
+// into one round trip. Failure-proof: any error resolves to safe defaults
+// rather than rejecting.
+function requestBootInfo() {
   return new Promise((resolve) => {
     try {
-      chrome.storage.local.get(['defaultVoice'], (data) => {
+      chrome.runtime.sendMessage({ type: 'engine-boot-info-request' }, (resp) => {
         void chrome.runtime.lastError;
-        resolve(typeof data?.defaultVoice === 'string' ? data.defaultVoice.trim() : '');
+        resolve(resp && resp.ok ? resp : { defaultVoice: '', loadedOnce: false });
       });
-    } catch (e) {
-      resolve('');
-    }
-  });
-}
-
-// True once the weights have loaded at least once — subsequent cold starts read
-// them from disk cache ("waking up"), not the network ("downloading").
-function getKokoroLoadedOnce() {
-  return new Promise((resolve) => {
-    try {
-      chrome.storage.local.get(['kokoroLoadedOnce'], (data) => {
-        void chrome.runtime.lastError;
-        resolve(data?.kokoroLoadedOnce === true);
-      });
-    } catch (e) {
-      resolve(false);
+    } catch {
+      resolve({ defaultVoice: '', loadedOnce: false });
     }
   });
 }
@@ -109,23 +97,22 @@ function ensureEngine() {
   if (initPromise) return initPromise;
   initPromise = (async () => {
     const attempt = pickBackend();
+    const bootInfo = await requestBootInfo();
     // Warm means the weights are already on disk from a prior load, so this
     // "download" is really a cache-backed wake-up.
-    const warm = await getKokoroLoadedOnce();
-    engineStatus = { status: 'downloading', progress: 0, device: attempt.device, error: null, warm };
+    engineStatus = { status: 'downloading', progress: 0, device: attempt.device, error: null, warm: bootInfo.loadedOnce };
     tts = await loadModel(attempt);
     // Pay the one-time graph-compilation cost now, not during the first real
     // sentence (same warmup trick as the local kokoro server). Warm with the
     // user's stored voice — validated now that tts is loaded — so its style
     // vector is fetched here rather than on their first real sentence.
-    const storedVoice = await getStoredVoice();
-    const warmVoice = resolveVoice(storedVoice || DEFAULT_VOICE_ID);
+    const warmVoice = resolveVoice(bootInfo.defaultVoice || DEFAULT_VOICE_ID);
     await tts.generate(WARMUP_TEXT, { voice: warmVoice, speed: 1.2 });
-    engineStatus = { status: 'ready', progress: 100, device: engineStatus.device, error: null, warm };
-    // Remember weights are now on disk so the next cold start reads as a
-    // wake-up instead of a download.
-    chrome.storage.local.set({ kokoroLoadedOnce: true }, () => { void chrome.runtime.lastError; });
-    console.log(`${LOG_PREFIX} model ready`, { device: engineStatus.device, warm });
+    engineStatus = { status: 'ready', progress: 100, device: engineStatus.device, error: null, warm: bootInfo.loadedOnce };
+    // Tell the background weights are now on disk so the next cold start
+    // reads as a wake-up instead of a download. Fire-and-forget.
+    chrome.runtime.sendMessage({ type: 'engine-loaded-once' }, () => { void chrome.runtime.lastError; });
+    console.log(`${LOG_PREFIX} model ready`, { device: engineStatus.device, warm: bootInfo.loadedOnce });
     return tts;
   })().catch((err) => {
     engineStatus = { status: 'error', progress: 0, device: null, error: err?.message || String(err), warm: false };

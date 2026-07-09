@@ -67,6 +67,19 @@ describe('offscreen routing', () => {
   });
 });
 
+describe('offscreen boot-info routing (storage-crash fix)', () => {
+  it('routes engine-boot-info-request: reads storage and responds with defaultVoice + loadedOnce', () => {
+    assert.match(backgroundJs, /if \(msg\.type === 'engine-boot-info-request'\)/);
+    assert.match(backgroundJs, /chrome\.storage\.local\.get\(\['defaultVoice', 'kokoroLoadedOnce'\]/);
+    assert.match(backgroundJs, /loadedOnce: Boolean\(/);
+  });
+
+  it('routes engine-loaded-once: persists kokoroLoadedOnce and responds ok', () => {
+    assert.match(backgroundJs, /if \(msg\.type === 'engine-loaded-once'\)/);
+    assert.match(backgroundJs, /chrome\.storage\.local\.set\(\{ kokoroLoadedOnce: true \}/);
+  });
+});
+
 describe('tts-cancel routing (Wave B)', () => {
   it('renames the onMessage listener sender param so tab scoping can read it', () => {
     assert.match(backgroundJs, /chrome\.runtime\.onMessage\.addListener\(\(msg, sender, sendResponse\)/);

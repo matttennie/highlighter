@@ -97,20 +97,25 @@ describe('offscreen tts-cancel protocol (Wave B)', () => {
 });
 
 describe('offscreen warmup + warm-status (Wave B)', () => {
-  it('warms with the stored voice, not only the hardcoded default', () => {
-    assert.match(engineJs, /chrome\.storage\.local\.get\(\['defaultVoice'\]/);
-    assert.match(engineJs, /resolveVoice\(storedVoice \|\| DEFAULT_VOICE_ID\)/);
+  it('requests boot info (stored voice + loaded-once) from the background instead of chrome.storage', () => {
+    assert.match(engineJs, /function requestBootInfo\(\)/);
+    assert.match(engineJs, /type: 'engine-boot-info-request'/);
+    assert.match(engineJs, /resolveVoice\(bootInfo\.defaultVoice \|\| DEFAULT_VOICE_ID\)/);
   });
 
-  it('persists kokoroLoadedOnce and exposes warm status', () => {
-    assert.match(engineJs, /chrome\.storage\.local\.set\(\{ kokoroLoadedOnce: true \}/);
-    assert.match(engineJs, /getKokoroLoadedOnce/);
+  it('reports loaded-once to the background via messaging and exposes warm status', () => {
+    assert.match(engineJs, /type: 'engine-loaded-once'/);
+    assert.match(engineJs, /bootInfo\.loadedOnce/);
     assert.match(engineJs, /warm/);
   });
 
   it('includes warm in the initial and error engineStatus shapes for cross-context uniformity', () => {
     assert.match(engineJs, /status: 'idle',[^}]*warm: false/);
     assert.match(engineJs, /status: 'error',[^}]*warm: false/);
+  });
+
+  it('never touches chrome.storage — offscreen documents do not have access to it', () => {
+    assert.doesNotMatch(engineJs, /chrome\.storage/);
   });
 });
 
