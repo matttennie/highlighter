@@ -55,6 +55,12 @@ describe('offscreen routing', () => {
   it('uses the Kokoro default voice', () => {
     assert.match(backgroundJs, /DEFAULT_VOICE_ID = 'af_heart'/);
   });
+
+  it('retries offscreen sends while the bundle is still evaluating', () => {
+    assert.match(backgroundJs, /Receiving end does not exist/);
+    assert.match(backgroundJs, /OFFSCREEN_SEND_RETRIES = 5/);
+    assert.match(backgroundJs, /offscreen-send-retry/);
+  });
 });
 
 describe('normalizeSpeed', () => {

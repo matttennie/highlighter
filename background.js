@@ -10,6 +10,8 @@ const DEBUG_LOG_KEY = 'debugLog';
 const DEBUG_LOG_LIMIT = 250;
 const LOG_FLUSH_INTERVAL_MS = 2000;
 const OFFSCREEN_URL = 'offscreen/offscreen.html';
+const OFFSCREEN_SEND_RETRIES = 5;
+const OFFSCREEN_SEND_RETRY_DELAY_MS = 200;
 
 let requestSeq = 0;
 let debugLogBuffer = [];
@@ -236,7 +238,7 @@ async function ensureOffscreenDocument() {
   await offscreenCreating;
 }
 
-function sendToOffscreen(message) {
+function sendToOffscreenOnce(message) {
   return new Promise((resolve, reject) => {
     chrome.runtime.sendMessage({ ...message, target: 'offscreen' }, (response) => {
       const error = chrome.runtime.lastError?.message || null;
@@ -247,6 +249,22 @@ function sendToOffscreen(message) {
       resolve(response);
     });
   });
+}
+
+// The offscreen document's large module bundle keeps evaluating after
+// createDocument() resolves; sends in that window fail with "Receiving end
+// does not exist". Retry briefly instead of surfacing a startup race.
+async function sendToOffscreen(message) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await sendToOffscreenOnce(message);
+    } catch (err) {
+      const retriable = /Receiving end does not exist/i.test(err?.message || '');
+      if (!retriable || attempt >= OFFSCREEN_SEND_RETRIES) throw err;
+      logDebug('offscreen-send-retry', { attempt: attempt + 1, type: message.type });
+      await new Promise((resolve) => setTimeout(resolve, OFFSCREEN_SEND_RETRY_DELAY_MS));
+    }
+  }
 }
 
 // ── Message router ──────────────────────────────────────────────────
