@@ -105,15 +105,48 @@ describe('server/kokoro_server.py', () => {
     assert.match(source, /WARMUP_TEXT\s*=\s*["']Warming up\.["']/);
   });
 
-  it('sends CORS headers on every response and handles OPTIONS preflight', () => {
-    assert.match(source, /Access-Control-Allow-Origin/);
-    assert.match(source, /CORS_ORIGIN\s*=\s*["']\*["']/);
+  it('never sends permissive CORS headers (the extension bypasses CORS via host_permissions)', () => {
+    assert.doesNotMatch(source, /Access-Control-Allow/);
+    assert.doesNotMatch(source, /CORS_ORIGIN\s*=\s*["']\*["']/);
     assert.match(source, /do_OPTIONS/);
     assert.match(source, /self\.send_response\(204\)/);
-    assert.match(source, /Access-Control-Allow-Methods/);
-    assert.match(source, /CORS_METHODS\s*=\s*["']GET, POST, OPTIONS["']/);
-    assert.match(source, /Access-Control-Allow-Headers/);
-    assert.match(source, /CORS_HEADERS\s*=\s*["']Content-Type["']/);
+  });
+
+  it('gates every request by Origin: allows missing Origin, rejects non-extension Origin with 403', () => {
+    assert.match(source, /ALLOWED_ORIGIN_PREFIX\s*=\s*["']chrome-extension:\/\/["']/);
+    assert.match(source, /def _origin_forbidden\(self\)/);
+    assert.match(source, /origin is not None and not origin\.startswith\(ALLOWED_ORIGIN_PREFIX\)/);
+    assert.match(source, /self\._send_json\(403,\s*\{"error":\s*"forbidden-origin"\}\)/);
+    // The gate must run in do_GET, do_POST, and do_OPTIONS.
+    const doGet = source.slice(source.indexOf('def do_GET'), source.indexOf('def do_POST'));
+    const doPost = source.slice(source.indexOf('def do_POST'), source.indexOf('def main'));
+    const doOptions = source.slice(source.indexOf('def do_OPTIONS'), source.indexOf('def do_GET'));
+    for (const block of [doGet, doPost, doOptions]) {
+      assert.match(block, /_origin_forbidden\(\)/);
+    }
+  });
+
+  it('caps POST bodies at 64KB, rejecting bad/oversized Content-Length before reading', () => {
+    assert.match(source, /MAX_BODY_BYTES\s*=\s*64\s*\*\s*1024/);
+    assert.match(source, /def _read_bounded_body\(self\)/);
+    assert.match(source, /self\._send_json\(411,\s*\{"error":\s*"body-too-large"\}\)/);
+    assert.match(source, /self\._send_json\(413,\s*\{"error":\s*"body-too-large"\}\)/);
+    assert.match(source, /length\s*>\s*MAX_BODY_BYTES/);
+    // The body must not be read before the length check runs.
+    const bodyBlock = source.slice(
+      source.indexOf('def _read_bounded_body'),
+      source.indexOf('def do_OPTIONS'),
+    );
+    assert.match(bodyBlock, /raw_length = self\.headers\.get\("Content-Length"\)/);
+  });
+
+  it('never leaks exception text to clients; logs full tracebacks to stderr only', () => {
+    assert.doesNotMatch(source, /\{"error":\s*str\(e\)\}/);
+    assert.match(source, /import traceback/);
+    assert.match(source, /traceback\.print_exc\(file=sys\.stderr\)/);
+    assert.match(source, /self\._send_json\(500,\s*\{"error":\s*"synthesis-failed"\}\)/);
+    assert.match(source, /self\._send_json\(500,\s*\{"error":\s*"internal-error"\}\)/);
+    assert.match(source, /self\._send_json\(400,\s*\{"error":\s*"bad-request"\}\)/);
   });
 
   it('unloads the idle model after 15 minutes with a background thread', () => {

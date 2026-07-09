@@ -7,7 +7,15 @@ for machines where this server isn't installed. Python 3 stdlib
 (http.server / ThreadingHTTPServer) + kokoro-onnx only — no third-party web
 framework.
 
-Endpoints (JSON in, JSON out, CORS enabled for the extension origin):
+This server is consumed only by the Highlighter Chrome extension, whose
+background-script fetches carry host_permissions for http://127.0.0.1/*
+and therefore bypass CORS entirely - no permissive CORS headers are sent.
+Instead, every request is origin-gated: a request with no `Origin` header
+(curl, local tools) is allowed; a request WITH an `Origin` header is only
+allowed if it starts with `chrome-extension://` - anything else gets a
+403 without being processed.
+
+Endpoints (JSON in, JSON out):
   GET  /health  -> {"status": "ok", "model": "loaded"|"cold", "engine": "kokoro-onnx"}
                    Answers instantly; never triggers a model load.
   GET  /voices  -> {"voices": [{"voiceId", "name", "category"}, ...]}
@@ -35,6 +43,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -58,14 +67,19 @@ DEFAULT_LANG = "en-us"
 MIN_SPEED = 0.5
 MAX_SPEED = 2.0
 
+# Only requests that either omit Origin (curl, local tools) or carry an
+# Origin starting with this prefix (the extension) are served; everything
+# else gets a 403 without being processed. No CORS headers are sent - the
+# extension's fetches carry host_permissions and bypass CORS entirely.
+ALLOWED_ORIGIN_PREFIX = "chrome-extension://"
+
+# Reject POST bodies larger than this without reading them.
+MAX_BODY_BYTES = 64 * 1024
+
 # Unload the model after 15 minutes with no synthesis requests. The HTTP
 # listener stays up; the next request after this just pays a cold load.
 MODEL_IDLE_UNLOAD_SECONDS = 15 * 60
 IDLE_CHECK_INTERVAL_SECONDS = 30
-
-CORS_ORIGIN = "*"
-CORS_METHODS = "GET, POST, OPTIONS"
-CORS_HEADERS = "Content-Type"
 
 # voice-id prefix -> (display category, kokoro-onnx `lang` code for create())
 PREFIX_INFO = {
@@ -219,25 +233,51 @@ class KokoroHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", CORS_ORIGIN)
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_json_body(self):
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        raw = self.rfile.read(length) if length > 0 else b""
-        if not raw:
-            return {}
-        return json.loads(raw.decode("utf-8"))
+    def _log_exception(self, context):
+        print("kokoro_server: unhandled exception in %s:" % context,
+              file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+
+    def _origin_forbidden(self):
+        """True if this request carries an Origin header that isn't the
+        extension's. Requests with no Origin header (curl, local tools) are
+        always allowed - the extension's own fetches bypass CORS via
+        host_permissions and never need permissive CORS headers here."""
+        origin = self.headers.get("Origin")
+        return origin is not None and not origin.startswith(ALLOWED_ORIGIN_PREFIX)
+
+    def _read_bounded_body(self):
+        """Read the POST body, capped at MAX_BODY_BYTES.
+
+        Returns the raw bytes read. Sends the appropriate error response and
+        returns None (without touching self.rfile) if Content-Length is
+        missing, non-integer, negative, or over the cap.
+        """
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            self._send_json(411, {"error": "body-too-large"})
+            return None
+        try:
+            length = int(raw_length)
+        except ValueError:
+            self._send_json(413, {"error": "body-too-large"})
+            return None
+        if length < 0 or length > MAX_BODY_BYTES:
+            self._send_json(413, {"error": "body-too-large"})
+            return None
+        return self.rfile.read(length) if length > 0 else b""
 
     def do_OPTIONS(self):
         t0 = time.time()
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", CORS_ORIGIN)
-        self.send_header("Access-Control-Allow-Methods", CORS_METHODS)
-        self.send_header("Access-Control-Allow-Headers", CORS_HEADERS)
-        self.send_header("Content-Length", "0")
-        self.end_headers()
+        if self._origin_forbidden():
+            self._send_json(403, {"error": "forbidden-origin"})
+        else:
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         _log("OPTIONS", self.path, 0, (time.time() - t0) * 1000)
 
     def do_GET(self):
@@ -245,6 +285,9 @@ class KokoroHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         chars = 0
         try:
+            if self._origin_forbidden():
+                self._send_json(403, {"error": "forbidden-origin"})
+                return
             if path == "/health":
                 self._send_json(200, {
                     "status": "ok",
@@ -255,8 +298,9 @@ class KokoroHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"voices": list_voices()})
             else:
                 self._send_json(404, {"error": "not-found"})
-        except Exception as e:
-            self._send_json(500, {"error": str(e)})
+        except Exception:
+            self._log_exception("GET %s" % path)
+            self._send_json(500, {"error": "internal-error"})
         finally:
             _log("GET", path, chars, (time.time() - t0) * 1000)
 
@@ -265,11 +309,23 @@ class KokoroHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         chars = 0
         try:
+            if self._origin_forbidden():
+                self._send_json(403, {"error": "forbidden-origin"})
+                return
+
             if path == "/tts":
+                raw = self._read_bounded_body()
+                if raw is None:
+                    return  # error response already sent by _read_bounded_body
+
                 try:
-                    body = self._read_json_body()
+                    body = json.loads(raw.decode("utf-8")) if raw else {}
                 except (ValueError, UnicodeDecodeError):
                     self._send_json(400, {"error": "invalid-json"})
+                    return
+
+                if not isinstance(body, dict):
+                    self._send_json(400, {"error": "bad-request"})
                     return
 
                 text = body.get("text")
@@ -288,13 +344,17 @@ class KokoroHandler(BaseHTTPRequestHandler):
 
                 try:
                     audio_b64 = synthesize_wav_base64(text, voice, speed)
-                except Exception as e:
-                    self._send_json(500, {"error": str(e)})
+                except Exception:
+                    self._log_exception("POST /tts synthesis")
+                    self._send_json(500, {"error": "synthesis-failed"})
                     return
 
                 self._send_json(200, {"audioContent": audio_b64})
             else:
                 self._send_json(404, {"error": "not-found"})
+        except Exception:
+            self._log_exception("POST %s" % path)
+            self._send_json(500, {"error": "internal-error"})
         finally:
             _log("POST", path, chars, (time.time() - t0) * 1000)
 
