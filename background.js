@@ -1,47 +1,31 @@
 'use strict';
 
 // ── Constants ───────────────────────────────────────────────────────
-const DEFAULT_VOICE_ID = 'Ashley';
-const DEFAULT_MODEL_ID = 'inworld-tts-1.5-max';
-// Inworld /tts/v1/voice rejects payloads above 2,000 characters per request.
+const DEFAULT_VOICE_ID = 'af_heart';
+// Not an API limit anymore — bounds worst-case on-device synth latency
+// for a single request (the content script sends one sentence at a time).
 const MAX_TEXT_LENGTH = 2000;
-const FETCH_TIMEOUT_MS = 30000;
 const LOG_PREFIX = '[Highlighter TTS]';
 const DEBUG_LOG_KEY = 'debugLog';
 const DEBUG_LOG_LIMIT = 250;
 const LOG_FLUSH_INTERVAL_MS = 2000;
-const INWORLD_KEY_NAME = 'inworld_Highlighter_API_Key';
-const INWORLD_VOICES_URL = 'https://api.inworld.ai/tts/v1/voices';
-const INWORLD_TTS_URL = 'https://api.inworld.ai/tts/v1/voice';
+const OFFSCREEN_URL = 'offscreen/offscreen.html';
 
 let requestSeq = 0;
 let debugLogBuffer = [];
 let isFlushPending = false;
+let offscreenCreating = null;
 
-const SUPPORTED_MODEL_IDS = new Set([
-  'inworld-tts-1.5-max',
-  'inworld-tts-1.5-mini',
-]);
-
-function isSelectableVoice(voice) {
-  // Any voice entry with an identifier is selectable.
-  return !!(voice && (voice.voiceId || voice.voice_id || voice.name || voice.displayName));
-}
-
-function getStorageSettings() {
+function getStoredDefaultVoice() {
   return new Promise((resolve) => {
-    chrome.storage.local.get([INWORLD_KEY_NAME, 'modelId', 'defaultVoice'], (data) => {
+    chrome.storage.local.get(['defaultVoice'], (data) => {
       const error = chrome.runtime.lastError?.message || null;
       if (error) {
         logDebug('settings-load-failed', { error });
-        resolve({});
+        resolve('');
         return;
       }
-      resolve({
-        apiKey: data[INWORLD_KEY_NAME] || '',
-        modelId: data.modelId,
-        defaultVoice: data.defaultVoice,
-      });
+      resolve(typeof data.defaultVoice === 'string' ? data.defaultVoice.trim() : '');
     });
   });
 }
@@ -50,7 +34,7 @@ function redactDebugDetails(details) {
   if (!details || typeof details !== 'object') return {};
   const copy = { ...details };
   for (const key of Object.keys(copy)) {
-    if (/^(apiKey|inworld_Highlighter_API_Key|token|secret|authorization|password)$/i.test(key)) {
+    if (/^(token|secret|authorization|password)$/i.test(key)) {
       copy[key] = copy[key] ? '[redacted]' : copy[key];
     }
   }
@@ -227,8 +211,46 @@ chrome.commands.onCommand.addListener((command) => {
   if (command === 'toggle-highlight-mode') sendToggleToActiveTab();
 });
 
+// ── Offscreen document management ───────────────────────────────────
+// The Kokoro model runs in an offscreen document (service workers can't
+// use WASM threads/WebGPU or keep the model warm). Created lazily on the
+// first TTS/voices/status request and kept alive to hold the model.
+async function ensureOffscreenDocument() {
+  const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+  if (contexts.length > 0) return;
+  if (!offscreenCreating) {
+    offscreenCreating = chrome.offscreen
+      .createDocument({
+        url: OFFSCREEN_URL,
+        reasons: ['WORKERS'],
+        justification: 'Runs the on-device Kokoro text-to-speech model (WASM/WebGPU), which cannot execute in a service worker.',
+      })
+      .finally(() => {
+        offscreenCreating = null;
+      });
+  }
+  await offscreenCreating;
+}
+
+function sendToOffscreen(message) {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage({ ...message, target: 'offscreen' }, (response) => {
+      const error = chrome.runtime.lastError?.message || null;
+      if (error) {
+        reject(new Error(error));
+        return;
+      }
+      resolve(response);
+    });
+  });
+}
+
 // ── Message router ──────────────────────────────────────────────────
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  // Offscreen-addressed messages are handled by the offscreen document's
+  // own listener; both contexts share chrome.runtime.onMessage.
+  if (msg && msg.target === 'offscreen') return false;
+
   if (msg.type === 'debug-event') {
     const entry = msg.entry || {};
     persistDebugEvent(entry.source || 'unknown', entry.event || 'unknown', entry.details || {});
@@ -258,7 +280,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           message: err.message,
           stack: err.stack,
         });
-        sendResponse({ ok: false, error: err.message });
+        sendResponse({ ok: false, error: 'engine-error', detail: err.message });
       });
     return true; // keep channel open for async sendResponse
   }
@@ -274,8 +296,15 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           message: err.message,
           stack: err.stack,
         });
-        sendResponse({ ok: false, error: err.message });
+        sendResponse({ ok: false, error: 'engine-error', detail: err.message });
       });
+    return true;
+  }
+
+  if (msg.type === 'engine-status-request') {
+    handleEngineStatusRequest()
+      .then(sendResponse)
+      .catch((err) => sendResponse({ ok: false, error: 'engine-error', detail: err.message }));
     return true;
   }
 
@@ -306,62 +335,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   return false;
 });
 
-// ── Fetch with timeout ──────────────────────────────────────────────
-async function fetchWithTimeout(url, options) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
-    return res;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-// ── Parse upstream error responses ──────────────────────────────────
-// Inworld errors usually arrive as JSON, e.g.
-//   { "error": { "code": 16, "message": "Authentication required.", "status": "UNAUTHENTICATED" } }
-// or, for Google-style envelopes,
-//   { "code": 401, "message": "...", "status": "UNAUTHENTICATED" }
-async function parseErrorDetail(res) {
-  let detail = res.statusText;
-  try {
-    const body = await res.json();
-    if (body && typeof body === 'object') {
-      const err = body.error;
-      if (err && typeof err === 'object') {
-        detail = [err.message, err.status, err.code]
-          .filter((piece) => piece !== undefined && piece !== null && piece !== '')
-          .join(' — ');
-      } else if (typeof err === 'string') {
-        detail = err;
-      } else if (body.message) {
-        detail = [body.message, body.status, body.code]
-          .filter((piece) => piece !== undefined && piece !== null && piece !== '')
-          .join(' — ');
-      } else {
-        detail = JSON.stringify(body);
-      }
-    }
-  } catch {
-    try {
-      const text = await res.text();
-      if (text) detail = text;
-    } catch {
-      /* fall through to statusText */
-    }
-  }
-  return detail || res.statusText;
-}
-
 // ── TTS request handler ─────────────────────────────────────────────
 async function handleTtsRequest({ text, voice, speed }, requestId = ++requestSeq) {
   const startedAt = performance.now();
-  const data = await getStorageSettings();
-  const apiKey = (data.apiKey || '').trim();
-  if (!apiKey) {
-    return { ok: false, error: 'no-token' };
-  }
 
   const normalizedText = typeof text === 'string' ? text.trim() : '';
   if (!normalizedText) {
@@ -376,225 +352,52 @@ async function handleTtsRequest({ text, voice, speed }, requestId = ++requestSeq
     };
   }
 
-  const rawVoiceId = typeof voice === 'string' ? voice.trim() : '';
-  const storedVoiceId = typeof data.defaultVoice === 'string' ? data.defaultVoice.trim() : '';
-  // Reject legacy 20-char hash-shaped voice IDs that may still be in storage from the
-  // pre-Inworld build. Inworld voice IDs are short human names like "Sarah".
-  const safeCaller = rawVoiceId.length > 15 ? '' : rawVoiceId;
-  const safeStored = storedVoiceId.length > 15 ? '' : storedVoiceId;
-  if (rawVoiceId && !safeCaller) {
-    logDebug('legacy-voice-id-dropped', { from: rawVoiceId, to: DEFAULT_VOICE_ID });
-  }
-  if (storedVoiceId && !safeStored) {
-    logDebug('legacy-voice-id-cleared', { from: storedVoiceId, to: DEFAULT_VOICE_ID });
-    chrome.storage.local.set({ defaultVoice: DEFAULT_VOICE_ID });
-  }
-  const voiceId = safeCaller || safeStored || DEFAULT_VOICE_ID;
-
-  const modelId = SUPPORTED_MODEL_IDS.has(data.modelId) ? data.modelId : DEFAULT_MODEL_ID;
+  const callerVoice = typeof voice === 'string' ? voice.trim() : '';
+  const voiceId = callerVoice || (await getStoredDefaultVoice()) || DEFAULT_VOICE_ID;
   const normalizedSpeed = normalizeSpeed(speed);
 
   logDebug('tts-normalized', {
     requestId,
     voiceId,
-    modelId,
     textLength: normalizedText.length,
     speed: normalizedSpeed,
   });
 
-  const result = await requestInworldTts({
-    apiKey,
-    modelId,
-    normalizedSpeed,
-    requestId,
+  await ensureOffscreenDocument();
+  const response = (await sendToOffscreen({
+    type: 'tts-request',
     text: normalizedText,
-    voiceId,
-  });
+    voice: voiceId,
+    speed: normalizedSpeed,
+  })) || { ok: false, error: 'no-response' };
+
   logDebug('tts-complete', {
     requestId,
-    ok: Boolean(result.ok),
-    error: result.error || null,
-    status: result.status || null,
+    ok: Boolean(response.ok),
+    error: response.error || null,
     elapsedMs: Math.round(performance.now() - startedAt),
   });
-  return result;
+  return response;
 }
 
 // ── Voices request handler ──────────────────────────────────────────
-async function handleVoicesRequest() {
-  const requestId = arguments[0] ?? ++requestSeq;
-  const startedAt = performance.now();
-  const data = await getStorageSettings();
-  const apiKey = (data.apiKey || '').trim();
-  if (!apiKey) {
-    return { ok: false, error: 'no-token' };
-  }
-
-  let res;
-  try {
-    logDebug('voices-fetch-start', { requestId });
-    res = await fetchWithTimeout(INWORLD_VOICES_URL, {
-      method: 'GET',
-      headers: {
-        // Inworld portal keys are pre-encoded base64 credentials, used with HTTP Basic.
-        'Authorization': `Basic ${apiKey}`,
-        'Accept': 'application/json',
-      },
-    });
-  } catch (err) {
-    if (err.name === 'AbortError') {
-      console.error(`${LOG_PREFIX} Voices request timed out after ${FETCH_TIMEOUT_MS}ms`, { requestId });
-      return { ok: false, error: 'timeout', detail: 'Request timed out.' };
-    }
-    throw err;
-  }
-
-  logDebug('voices-fetch-response', {
-    requestId,
-    status: res.status,
-    ok: res.ok,
-    elapsedMs: Math.round(performance.now() - startedAt),
-  });
-
-  if (!res.ok) {
-    const detail = await parseErrorDetail(res);
-    console.error(`${LOG_PREFIX} Voices API error:`, {
-      requestId,
-      status: res.status,
-      detail,
-    });
-
-    if (res.status === 401) return { ok: false, error: 'auth-failed', detail };
-    if (res.status === 429) return { ok: false, error: 'rate-limited', detail };
-    return { ok: false, error: 'api-error', status: res.status, detail };
-  }
-
-  const payload = await res.json();
-  // Inworld /tts/v1/voices returns: { voices: [{ voiceId, displayName, languages: [...], description, tags, isCustom }] }
-  const voices = Array.isArray(payload.voices)
-    ? payload.voices.filter(isSelectableVoice).map((v) => {
-        const voiceId = v.voiceId || v.voice_id || v.name || v.displayName;
-        const name = v.displayName || v.name || voiceId || 'Unknown Voice';
-        const language = Array.isArray(v.languages) && v.languages.length
-          ? v.languages[0]
-          : (v.language || 'other');
-        return {
-          voiceId,
-          name,
-          category: language,
-          description: v.description || '',
-          tags: Array.isArray(v.tags) ? v.tags : [],
-        };
-      })
-    : [];
-
-  logDebug('voices-parsed', { requestId, count: voices.length, sample: voices.slice(0, 3).map((v) => v.voiceId) });
-  return { ok: true, voices };
+async function handleVoicesRequest(requestId = ++requestSeq) {
+  logDebug('voices-request-forwarded', { requestId });
+  await ensureOffscreenDocument();
+  const response = (await sendToOffscreen({ type: 'voices-request' })) || { ok: false, error: 'no-response' };
+  logDebug('voices-parsed', { requestId, ok: Boolean(response.ok), count: response.voices?.length || 0 });
+  return response;
 }
 
-async function requestInworldTts({ apiKey, modelId, normalizedSpeed, requestId, text, voiceId }) {
-  const url = INWORLD_TTS_URL;
-  const startedAt = performance.now();
-  let res;
-  try {
-    logDebug('tts-fetch-start', {
-      requestId,
-      voiceId,
-      modelId,
-      textLength: text.length,
-      speed: normalizedSpeed,
-    });
-
-    // Inworld /tts/v1/voice expects JSON in *and* JSON out (with audioContent base64-encoded).
-    // audioConfig.speakingRate handles pacing server-side, which sounds far better than
-    // bumping HTML5 Audio.playbackRate after the fact.
-    const body = {
-      text,
-      voiceId,
-      modelId,
-      audioConfig: {
-        audioEncoding: 'MP3',
-        sampleRateHertz: 48000,
-        speakingRate: normalizedSpeed,
-      },
-    };
-
-    res = await fetchWithTimeout(url, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Basic ${apiKey}`,
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-      },
-      body: JSON.stringify(body),
-    });
-  } catch (err) {
-    if (err.name === 'AbortError') {
-      console.error(`${LOG_PREFIX} Request timed out after ${FETCH_TIMEOUT_MS}ms`, { requestId });
-      return { ok: false, error: 'timeout', detail: 'Request timed out.' };
-    }
-    throw err;
-  }
-
-  logDebug('tts-fetch-response', {
-    requestId,
-    status: res.status,
-    ok: res.ok,
-    contentType: res.headers.get('content-type') || null,
-    elapsedMs: Math.round(performance.now() - startedAt),
-  });
-
-  return audioResponseFromHttp(res, url, 'audio/mpeg', requestId);
+// ── Engine status handler ───────────────────────────────────────────
+async function handleEngineStatusRequest() {
+  await ensureOffscreenDocument();
+  return (await sendToOffscreen({ type: 'engine-status-request' })) || { ok: false, error: 'no-response' };
 }
 
-async function mapHttpError(res, url, requestId) {
-  const detail = await parseErrorDetail(res);
-  console.error(`${LOG_PREFIX} API error:`, {
-    requestId,
-    status: res.status,
-    detail,
-    url,
-  });
-
-  if (res.status === 401) return { ok: false, error: 'auth-failed', detail };
-  if (res.status === 402) return { ok: false, error: 'billing-required', detail };
-  if (res.status === 429) return { ok: false, error: 'rate-limited', detail };
-  return { ok: false, error: 'api-error', status: res.status, detail };
-}
-
-async function audioResponseFromHttp(res, url, mimeType, requestId) {
-  if (!res.ok) {
-    return mapHttpError(res, url, requestId);
-  }
-
-  // Inworld returns JSON: { audioContent: "<base64>", usage: {...}, timestampInfo: {...} }.
-  // We pass the base64 straight through as a data URL; the content script can blob-ify it.
-  let payload;
-  try {
-    payload = await res.json();
-  } catch (err) {
-    logDebug('tts-json-parse-failed', { requestId, message: err?.message || String(err) });
-    return { ok: false, error: 'bad-response', detail: 'Inworld response was not valid JSON.' };
-  }
-
-  const audioContent = typeof payload?.audioContent === 'string' ? payload.audioContent.trim() : '';
-  if (!audioContent) {
-    logDebug('tts-empty-audio-content', { requestId, payloadKeys: payload ? Object.keys(payload) : null });
-    return { ok: false, error: 'bad-response', detail: 'Response missing audioContent.' };
-  }
-
-  logDebug('tts-audio-buffered', {
-    requestId,
-    base64Length: audioContent.length,
-    usage: payload.usage || null,
-  });
-  return { ok: true, audioDataUrl: `data:${mimeType};base64,${audioContent}` };
-}
-
-// Inworld /tts/v1/voice rejects audioConfig.speakingRate outside 0.5..1.5.
+// Kokoro's ONNX graph accepts speeds in [0.5, 2.0].
 function normalizeSpeed(speed) {
   const parsed = parseFloat(speed);
   if (!Number.isFinite(parsed)) return 1.0;
-  return Math.max(0.5, Math.min(1.5, parsed));
+  return Math.max(0.5, Math.min(2.0, parsed));
 }
-
