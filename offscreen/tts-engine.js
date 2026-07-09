@@ -16,6 +16,14 @@ const IDLE_CHECK_INTERVAL_MS = 60 * 1000;
 // ONNX Runtime must load its WASM from inside the extension package —
 // MV3 forbids remote code. Model *weights* are data and may be fetched.
 env.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL('offscreen/ort/');
+// COOP/COEP in the manifest makes extension pages crossOriginIsolated,
+// unlocking SharedArrayBuffer so ONNX Runtime can use multiple threads.
+// Guard anyway: without isolation, force 1 thread instead of letting ORT
+// crash trying to build a threaded runtime.
+if (!globalThis.crossOriginIsolated) {
+  env.backends.onnx.wasm.numThreads = 1;
+}
+console.log(`${LOG_PREFIX} crossOriginIsolated=${globalThis.crossOriginIsolated}`);
 env.allowLocalModels = false;
 
 let tts = null;

@@ -32,4 +32,9 @@ describe('manifest.json', () => {
     assert.equal(manifest.version, '0.2.0');
     assert.match(manifest.description, /on-device|Kokoro/i);
   });
+
+  it('enables cross-origin isolation so WASM inference can use threads', () => {
+    assert.equal(manifest.cross_origin_opener_policy?.value, 'same-origin');
+    assert.equal(manifest.cross_origin_embedder_policy?.value, 'require-corp');
+  });
 });

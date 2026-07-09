@@ -49,6 +49,11 @@ describe('offscreen document', () => {
     assert.match(engineJs, /error: 'model-loading'/);
     assert.match(engineJs, /progress: engineStatus\.progress/);
   });
+
+  it('guards ORT threading on crossOriginIsolated', () => {
+    assert.match(engineJs, /crossOriginIsolated/);
+    assert.match(engineJs, /numThreads = 1/);
+  });
 });
 
 describe('clampSpeed (offscreen mirror)', () => {
