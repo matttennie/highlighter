@@ -11,20 +11,18 @@ import { describe, it } from 'node:test';
 function getErrorMessage(response) {
   if (!response) return 'No response from background';
   switch (response.error) {
-    case 'no-token':          return 'Set Inworld API key in extension settings';
     case 'empty-text':        return 'Select some text before playing';
     case 'text-too-long':     return response.detail || 'Text exceeds maximum length';
-    case 'auth-failed':       return response.detail
-      ? `Authentication failed\n${truncateDetail(response.detail)}`
-      : 'Invalid API key';
-    case 'billing-required':  return response.detail
-      ? `API error (402)\n${truncateDetail(response.detail)}`
-      : 'API error (402)\nCheck Inworld billing/quota';
-    case 'rate-limited':      return 'Rate limited — try again shortly';
+    case 'model-loading':     return typeof response.progress === 'number' && response.progress > 0
+      ? `Voice model downloading (${response.progress}%) — using system voice meanwhile`
+      : 'Voice model loading — using system voice meanwhile';
+    case 'engine-error':      return response.detail
+      ? `Voice engine error\n${truncateDetail(response.detail)}`
+      : 'Voice engine error — using system voice';
+    case 'synthesis-failed':  return response.detail
+      ? `Synthesis failed\n${truncateDetail(response.detail)}`
+      : 'Synthesis failed — using system voice';
     case 'timeout':           return 'Request timed out — try again';
-    case 'api-error':         return response.detail
-      ? `API error (${response.status})\n${truncateDetail(response.detail)}`
-      : `API error (${response.status})`;
     default:                  return response.error || 'Unknown error';
   }
 }
@@ -44,10 +42,6 @@ describe('getErrorMessage', () => {
     assert.equal(getErrorMessage(undefined), 'No response from background');
   });
 
-  it('maps no-token', () => {
-    assert.match(getErrorMessage({ error: 'no-token' }), /Inworld/i);
-  });
-
   it('maps empty-text', () => {
     assert.match(getErrorMessage({ error: 'empty-text' }), /select some text/i);
   });
@@ -62,54 +56,28 @@ describe('getErrorMessage', () => {
     assert.match(msg, /exceeds maximum/i);
   });
 
-  it('maps auth-failed without detail', () => {
-    assert.match(getErrorMessage({ error: 'auth-failed' }), /invalid/i);
-  });
-
-  it('includes upstream auth detail when available', () => {
-    const msg = getErrorMessage({ error: 'auth-failed', detail: 'Missing permission' });
-    assert.match(msg, /authentication failed/i);
-    assert.match(msg, /missing permission/i);
-  });
-
-  it('maps billing-required with 402', () => {
-    const msg = getErrorMessage({ error: 'billing-required' });
-    assert.match(msg, /402/);
-    assert.match(msg, /billing/i);
-    assert.match(msg, /Inworld/i);
-  });
-
-  it('includes upstream billing-required detail when available', () => {
-    const msg = getErrorMessage({
-      error: 'billing-required',
-      detail: 'Plan quota exceeded.',
-    });
-    assert.match(msg, /402/);
-    assert.match(msg, /quota exceeded/i);
-  });
-
-  it('maps rate-limited', () => {
-    assert.match(getErrorMessage({ error: 'rate-limited' }), /rate/i);
-  });
-
   it('maps timeout', () => {
     assert.match(getErrorMessage({ error: 'timeout' }), /timed out/i);
   });
 
-  it('maps api-error with status code', () => {
-    const msg = getErrorMessage({ error: 'api-error', status: 429 });
-    assert.match(msg, /429/);
+  it('maps model-loading with progress', () => {
+    const msg = getErrorMessage({ error: 'model-loading', progress: 43 });
+    assert.match(msg, /43%/);
+    assert.match(msg, /system voice/i);
   });
 
-  it('maps api-error with 500 status', () => {
-    const msg = getErrorMessage({ error: 'api-error', status: 500 });
-    assert.match(msg, /500/);
+  it('maps model-loading without progress', () => {
+    assert.match(getErrorMessage({ error: 'model-loading' }), /loading/i);
   });
 
-  it('includes upstream api-error detail when available', () => {
-    const msg = getErrorMessage({ error: 'api-error', status: 500, detail: 'Backend rejected request' });
-    assert.match(msg, /500/);
-    assert.match(msg, /backend rejected request/i);
+  it('maps engine-error with detail', () => {
+    const msg = getErrorMessage({ error: 'engine-error', detail: 'WebGPU adapter lost' });
+    assert.match(msg, /engine error/i);
+    assert.match(msg, /WebGPU adapter lost/);
+  });
+
+  it('maps synthesis-failed', () => {
+    assert.match(getErrorMessage({ error: 'synthesis-failed' }), /synthesis failed/i);
   });
 
   it('falls back to error string for unknown codes', () => {
@@ -250,7 +218,7 @@ describe('Request ID staleness guard', () => {
 function normalizePlaybackRate(speed) {
   const parsed = parseFloat(speed);
   if (!Number.isFinite(parsed)) return 1.0;
-  return Math.max(0.5, Math.min(1.5, parsed));
+  return Math.max(0.5, Math.min(2.0, parsed));
 }
 
 describe('normalizePlaybackRate', () => {
@@ -275,10 +243,10 @@ describe('normalizePlaybackRate', () => {
     assert.equal(normalizePlaybackRate(1), 1.0);
   });
 
-  it('clamps values above maximum to 1.5', () => {
-    assert.equal(normalizePlaybackRate(3), 1.5);
-    assert.equal(normalizePlaybackRate(2.1), 1.5);
-    assert.equal(normalizePlaybackRate(100), 1.5);
+  it('clamps values above maximum to 2.0', () => {
+    assert.equal(normalizePlaybackRate(3), 2.0);
+    assert.equal(normalizePlaybackRate(2.1), 2.0);
+    assert.equal(normalizePlaybackRate(100), 2.0);
   });
 });
 

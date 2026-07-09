@@ -10,14 +10,14 @@
   window.__highlighterTtsContentLoaded = true;
 
   // ── Constants ──────────────────────────────────────────────────────
-  const DEFAULT_VOICE_ID = 'Ashley';
+  const DEFAULT_VOICE_ID = 'af_heart';
   const CURSOR_SIZE      = 22;
   const LINE_TOLERANCE   = 14;  // for END line detection (confirmed working)
-  // Full Inworld API range; server rejects anything outside [0.5, 1.5].
-  // 21 detents in 0.05 increments. Math.round avoids float-arithmetic drift
-  // (0.5 + 14*0.05 !== 1.2 in IEEE 754) that would break SPEEDS.indexOf checks.
-  const SPEEDS = Array.from({ length: 21 }, (_, i) => Math.round((0.5 + i * 0.05) * 100) / 100);
-  const SPEED_DEFAULT_INDEX = SPEEDS.indexOf(1.0); // 10
+  // Kokoro's supported synthesis range. 16 detents in 0.1 increments.
+  // Math.round avoids float-arithmetic drift (0.5 + 7*0.1 !== 1.2 in
+  // IEEE 754) that would break SPEEDS.indexOf checks.
+  const SPEEDS = Array.from({ length: 16 }, (_, i) => Math.round((0.5 + i * 0.1) * 100) / 100);
+  const SPEED_DEFAULT_INDEX = SPEEDS.indexOf(1.0); // 5
   const TTS_TIMEOUT_MS   = 35000; // FIX 7: response timeout
   const AUDIO_START_TIMEOUT_MS = 8000;
   const BASE64_CHUNK_SIZE = 8192;
@@ -1156,7 +1156,7 @@
     const audioUrl = audioDataUrlToObjectUrl(dataUrl) || dataUrl;
     pbAudioObjectUrl = audioUrl.startsWith('blob:') ? audioUrl : null;
     pbAudio = new Audio(audioUrl);
-    // Speed is applied server-side via audioConfig.speakingRate; double-applying
+    // Speed is applied by Kokoro during synthesis; double-applying
     // playbackRate here would compound the rate and degrade pitch.
     pbAudio.playbackRate = 1.0;
 
@@ -1349,22 +1349,18 @@
   function getErrorMessage(response) {
     if (!response) return 'No response from background';
     switch (response.error) {
-      case 'no-token':          return 'Set Inworld API key in extension settings';
       case 'empty-text':        return 'Select some text before playing';
-      case 'auth-failed':       return response.detail
-        ? `Authentication failed\n${truncateDetail(response.detail)}`
-        : 'Invalid API key';
-      case 'billing-required':  return response.detail
-        ? `API error (402)\n${truncateDetail(response.detail)}`
-        : 'API error (402)\nCheck Inworld billing/quota';
-      case 'rate-limited':      return 'Rate limited — try again shortly';
-      case 'text-too-long':     return response.detail
-        ? `Text too long\n${truncateDetail(response.detail)}`
-        : 'Selected text is too long for one request';
-      case 'timeout':           return 'Request timed out — try a shorter selection';
-      case 'api-error':         return response.detail
-        ? `API error (${response.status})\n${truncateDetail(response.detail)}`
-        : `API error (${response.status})`;
+      case 'text-too-long':     return response.detail || 'Text exceeds maximum length';
+      case 'model-loading':     return typeof response.progress === 'number' && response.progress > 0
+        ? `Voice model downloading (${response.progress}%) — using system voice meanwhile`
+        : 'Voice model loading — using system voice meanwhile';
+      case 'engine-error':      return response.detail
+        ? `Voice engine error\n${truncateDetail(response.detail)}`
+        : 'Voice engine error — using system voice';
+      case 'synthesis-failed':  return response.detail
+        ? `Synthesis failed\n${truncateDetail(response.detail)}`
+        : 'Synthesis failed — using system voice';
+      case 'timeout':           return 'Request timed out — try again';
       default:                  return response.error || 'Unknown error';
     }
   }
@@ -1372,7 +1368,7 @@
   function normalizePlaybackRate(speed) {
     const parsed = parseFloat(speed);
     if (!Number.isFinite(parsed)) return 1.0;
-    return Math.max(0.5, Math.min(1.5, parsed));
+    return Math.max(0.5, Math.min(2.0, parsed));
   }
 
   function nearestSpeedIndex(speed) {
