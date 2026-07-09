@@ -13,6 +13,7 @@
     "watch:extension": "node tests/watch-extension.mjs"
   },
   "devDependencies": {
+    "@huggingface/transformers": "^3.5.1",
     "esbuild": "^0.25.0",
     "kokoro-js": "^1.2.1",
     "playwright": "^1.59.1"

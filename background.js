@@ -106,6 +106,10 @@ function createContextMenu() {
 
 chrome.runtime.onInstalled.addListener(() => {
   logDebug('extension-installed');
+  // Purge legacy Inworld-era settings (the API key is a live credential).
+  chrome.storage.local.remove(['inworld_Highlighter_API_Key', 'modelId'], () => {
+    void chrome.runtime.lastError;
+  });
   createContextMenu();
 });
 

@@ -44,7 +44,8 @@ describe('offscreen routing', () => {
   });
 
   it('has no Inworld, ElevenLabs, or API-key remnants', () => {
-    assert.doesNotMatch(backgroundJs, /inworld/i);
+    assert.doesNotMatch(backgroundJs, /api\.inworld\.ai/);
+    assert.match(backgroundJs, /chrome\.storage\.local\.remove\(\['inworld_Highlighter_API_Key', 'modelId'\]/);
     assert.doesNotMatch(backgroundJs, /elevenlabs/i);
     assert.doesNotMatch(backgroundJs, /apiKey/);
     assert.doesNotMatch(backgroundJs, /Authorization/);

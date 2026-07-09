@@ -4,7 +4,11 @@
  * stale request guard, playback-rate normalization, and base64 encoding.
  */
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { describe, it } from 'node:test';
+
+const rootDir = path.resolve(import.meta.dirname, '..');
 
 // ── Error message mapping (mirrors content.js) ─────────────────────
 
@@ -23,6 +27,7 @@ function getErrorMessage(response) {
       ? `Synthesis failed\n${truncateDetail(response.detail)}`
       : 'Synthesis failed — using system voice';
     case 'timeout':           return 'Request timed out — try again';
+    case 'no-response':       return 'Voice engine did not respond — using system voice';
     default:                  return response.error || 'Unknown error';
   }
 }
@@ -60,6 +65,10 @@ describe('getErrorMessage', () => {
     assert.match(getErrorMessage({ error: 'timeout' }), /timed out/i);
   });
 
+  it('maps no-response', () => {
+    assert.match(getErrorMessage({ error: 'no-response' }), /did not respond/i);
+  });
+
   it('maps model-loading with progress', () => {
     const msg = getErrorMessage({ error: 'model-loading', progress: 43 });
     assert.match(msg, /43%/);
@@ -86,6 +95,15 @@ describe('getErrorMessage', () => {
 
   it('returns "Unknown error" for empty error field', () => {
     assert.equal(getErrorMessage({ error: '' }), 'Unknown error');
+  });
+});
+
+describe('error-code contract', () => {
+  it('every error code the background/offscreen can emit has a friendly mapping in content.js', () => {
+    const contentJs = fs.readFileSync(path.join(rootDir, 'content', 'content.js'), 'utf8');
+    for (const code of ['empty-text', 'text-too-long', 'model-loading', 'engine-error', 'synthesis-failed', 'no-response']) {
+      assert.match(contentJs, new RegExp(`case '${code}':`), `content.js getErrorMessage must map '${code}'`);
+    }
   });
 });
 

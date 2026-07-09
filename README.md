@@ -6,14 +6,15 @@
 
 All speech is generated on your device by the Kokoro-82M model — no API
 key, no cloud calls, no per-use cost. On first use the extension downloads
-the voice model (~90 MB, cached permanently); until it finishes, playback
-falls back to your system voice.
+the Kokoro voice model (~326 MB on GPU-accelerated Chrome, ~92 MB on the
+CPU fallback path — one time, cached permanently); until it finishes,
+playback falls back to your system voice.
 
 ## Features
 
 - **Highlight Mode:** Brush-style cursor for intuitive text selection.
 - **Floating Transport:** Play, pause, skip, and adjust settings from a draggable in-page player.
-- **On-Device TTS:** Speech synthesized locally by the Kokoro-82M model — no API key, no cloud calls, no per-use cost.
+- **On-Device TTS:** Speech synthesized locally by the Kokoro-82M model.
 - **Voice Management:** Grouped list of on-device Kokoro voices with adjustable playback speed.
 - **Robustness:** Falls back to the browser's `speechSynthesis` while the voice model is still downloading or if on-device synthesis fails.
 
@@ -42,7 +43,8 @@ npm run build
 - Select this folder
 
 No API key or account is required. The first time you use the extension it
-downloads the Kokoro voice model (~90 MB) and caches it permanently.
+downloads the Kokoro voice model (~326 MB on GPU-accelerated Chrome, ~92 MB
+on the CPU fallback path) and caches it permanently.
 
 ## Usage
 

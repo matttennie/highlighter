@@ -1361,6 +1361,7 @@
         ? `Synthesis failed\n${truncateDetail(response.detail)}`
         : 'Synthesis failed — using system voice';
       case 'timeout':           return 'Request timed out — try again';
+      case 'no-response':       return 'Voice engine did not respond — using system voice';
       default:                  return response.error || 'Unknown error';
     }
   }
