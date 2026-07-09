@@ -25,6 +25,9 @@
   const PREFETCH_LOOKAHEAD = 1;     // sentences after the currently-playing one
   const SKIP_DEBOUNCE_MS = 250;     // collapse rapid skip taps into one synth call
   const AUDIO_CACHE_LIMIT = 12;     // LRU bound on cached sentence audio
+  // Kokoro truncates synthesis around 512 phoneme tokens (~450 chars);
+  // longer sentences are split at clause boundaries so nothing is lost.
+  const SENTENCE_CHUNK_LIMIT = 400;
 
   // ── State ──────────────────────────────────────────────────────────
   let highlightMode = false;
@@ -347,7 +350,7 @@
       sel.addRange(range);
 
       // Store sentences for playback navigation
-      pbSentences = selected;
+      pbSentences = selected.flatMap(splitLongSentence);
       pbIndex     = 0;
       // New stroke = entirely different sentence array; old cache is meaningless.
       cancelSkipDebounce();
@@ -389,6 +392,38 @@
       'nav, header, footer, aside, ' +
       '[role="navigation"], [role="banner"], [role="contentinfo"], [role="complementary"]'
     ) !== null;
+  }
+
+  // Split text into chunks of at most `limit` chars, preferring clause
+  // boundaries (,;:—) and falling back to the last space before the limit.
+  // Exposed shape mirrors tests/test-tts.js#splitLongSentenceText.
+  function splitLongSentenceText(text, limit) {
+    const trimmed = typeof text === 'string' ? text.trim() : '';
+    if (trimmed.length <= limit) return trimmed ? [trimmed] : [];
+    const chunks = [];
+    let rest = trimmed;
+    while (rest.length > limit) {
+      const window = rest.slice(0, limit);
+      let cut = -1;
+      for (const m of window.matchAll(/[,;:—]/g)) cut = m.index;
+      if (cut < 1) cut = window.lastIndexOf(' ');
+      if (cut < 1) cut = limit - 1; // no boundary at all — hard split
+      chunks.push(rest.slice(0, cut + 1).trim());
+      rest = rest.slice(cut + 1).trim();
+    }
+    if (rest) chunks.push(rest);
+    return chunks.filter(Boolean);
+  }
+
+  // A sentence longer than the synth limit becomes several playback entries
+  // sharing the original Range, so highlighting still covers the full
+  // sentence while its chunks play back-to-back.
+  function splitLongSentence(sentence) {
+    if (!sentence || typeof sentence.text !== 'string' || sentence.text.length <= SENTENCE_CHUNK_LIMIT) {
+      return [sentence];
+    }
+    return splitLongSentenceText(sentence.text, SENTENCE_CHUNK_LIMIT)
+      .map((chunkText) => ({ ...sentence, text: chunkText }));
   }
 
   // ── Sentence collection ────────────────────────────────────────────

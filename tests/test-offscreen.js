@@ -28,8 +28,9 @@ describe('offscreen document', () => {
   });
 
   it('falls back from WebGPU to WASM q8', () => {
-    assert.match(engineJs, /device: 'webgpu', dtype: 'fp32'/);
+    assert.match(engineJs, /device: 'webgpu', dtype: 'fp16'/);
     assert.match(engineJs, /device: 'wasm', dtype: 'q8'/);
+    assert.match(engineJs, /navigator\.gpu\.requestAdapter\(\)/);
   });
 
   it('produces WAV data URLs and uses the shared default voice', () => {

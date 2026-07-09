@@ -35,10 +35,18 @@ const LANGUAGE_LABELS = {
   'zh': 'Chinese',
 };
 
-function pickBackend() {
-  // q8 quantization is unreliable on WebGPU; fp32 is the recommended pairing.
+async function pickBackend() {
+  // navigator.gpu existing does not mean the adapter works — probe it so
+  // broken-GPU machines skip straight to WASM instead of downloading the
+  // large WebGPU model first. fp16 halves the download vs fp32 with no
+  // meaningful audio-quality loss for speech.
   if (typeof navigator !== 'undefined' && navigator.gpu) {
-    return { device: 'webgpu', dtype: 'fp32' };
+    try {
+      const adapter = await navigator.gpu.requestAdapter();
+      if (adapter) return { device: 'webgpu', dtype: 'fp16' };
+    } catch {
+      // fall through to WASM
+    }
   }
   return { device: 'wasm', dtype: 'q8' };
 }
@@ -58,7 +66,7 @@ function loadModel({ device, dtype }) {
 function ensureEngine() {
   if (initPromise) return initPromise;
   initPromise = (async () => {
-    const attempt = pickBackend();
+    const attempt = await pickBackend();
     engineStatus = { status: 'downloading', progress: 0, device: attempt.device, error: null };
     try {
       tts = await loadModel(attempt);

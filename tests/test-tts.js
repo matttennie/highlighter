@@ -328,3 +328,66 @@ describe('arrayBufferToBase64', () => {
     assert.equal(atob(base64), 'RIFF');
   });
 });
+
+// ── splitLongSentenceText (mirrors content.js) ───────────────────────
+
+// Mirror of content.js#splitLongSentenceText — keep byte-identical.
+// Split text into chunks of at most `limit` chars, preferring clause
+// boundaries (,;:—) and falling back to the last space before the limit.
+function splitLongSentenceText(text, limit) {
+  const trimmed = typeof text === 'string' ? text.trim() : '';
+  if (trimmed.length <= limit) return trimmed ? [trimmed] : [];
+  const chunks = [];
+  let rest = trimmed;
+  while (rest.length > limit) {
+    const window = rest.slice(0, limit);
+    let cut = -1;
+    for (const m of window.matchAll(/[,;:—]/g)) cut = m.index;
+    if (cut < 1) cut = window.lastIndexOf(' ');
+    if (cut < 1) cut = limit - 1; // no boundary at all — hard split
+    chunks.push(rest.slice(0, cut + 1).trim());
+    rest = rest.slice(cut + 1).trim();
+  }
+  if (rest) chunks.push(rest);
+  return chunks.filter(Boolean);
+}
+
+describe('splitLongSentenceText', () => {
+  it('returns short text unchanged', () => {
+    assert.deepEqual(splitLongSentenceText('Hello world.', 400), ['Hello world.']);
+  });
+
+  it('returns empty array for empty/whitespace text', () => {
+    assert.deepEqual(splitLongSentenceText('   ', 400), []);
+  });
+
+  it('splits at the last clause boundary before the limit', () => {
+    const chunks = splitLongSentenceText('aaaa, bbbb; cccc dddd', 12);
+    assert.deepEqual(chunks, ['aaaa, bbbb;', 'cccc dddd']);
+  });
+
+  it('falls back to the last space when no clause boundary exists', () => {
+    const chunks = splitLongSentenceText('aaaa bbbb cccc', 11);
+    assert.deepEqual(chunks, ['aaaa bbbb', 'cccc']);
+  });
+
+  it('hard-splits unbroken runs with no boundaries', () => {
+    const chunks = splitLongSentenceText('a'.repeat(25), 10);
+    assert.ok(chunks.every((c) => c.length <= 10));
+    assert.equal(chunks.join(''), 'a'.repeat(25));
+  });
+
+  it('never emits a chunk above the limit and loses no words', () => {
+    const words = Array.from({ length: 120 }, (_, i) => `word${i}`);
+    const text = words.join(' ');
+    const chunks = splitLongSentenceText(text, 80);
+    assert.ok(chunks.every((c) => c.length <= 80));
+    assert.deepEqual(chunks.join(' ').split(/\s+/), words);
+  });
+
+  it('adds a source-contract check that content.js applies chunking at the assignment site', () => {
+    const contentJs = fs.readFileSync(path.join(rootDir, 'content', 'content.js'), 'utf8');
+    assert.match(contentJs, /pbSentences = selected\.flatMap\(splitLongSentence\)/);
+    assert.match(contentJs, /SENTENCE_CHUNK_LIMIT = 400/);
+  });
+});
