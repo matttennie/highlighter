@@ -1,25 +1,22 @@
-const inworldTokenInput = document.getElementById('inworldApiToken');
-const modelSelect = document.getElementById('modelId');
 const voiceSelect = document.getElementById('defaultVoice');
-const speedSelect = document.getElementById('defaultSpeed');
+const speedSlider = document.getElementById('defaultSpeed');
+const speedValueEl = document.getElementById('speedValue');
+const engineStatusEl = document.getElementById('engineStatus');
 const articleToggle = document.getElementById('articleMode');
 const statusEl = document.getElementById('status');
 const copyDebugLogBtn = document.getElementById('copyDebugLog');
 const clearDebugLogBtn = document.getElementById('clearDebugLog');
-const testApiBtn = document.getElementById('testApiBtn');
+const testVoiceBtn = document.getElementById('testVoiceBtn');
 const debugPreview = document.getElementById('debugPreview');
-const DEFAULT_VOICE_ID = 'Ashley';
-const DEFAULT_MODEL_ID = 'inworld-tts-1.5-max';
+const DEFAULT_VOICE_ID = 'af_heart';
 const LOG_PREFIX = '[Highlighter Popup]';
-const DEBUG_LOG_KEY = 'debugLog';
-const INWORLD_KEY_NAME = 'inworld_Highlighter_API_Key';
-const SUPPORTED_MODEL_IDS = new Set([
-  'inworld-tts-1.5-max',
-  'inworld-tts-1.5-mini',
-]);
+const SPEED_MIN = 0.5;
+const SPEED_MAX = 2.0;
+const ENGINE_POLL_MS = 1000;
 
 let statusTimer = 0;
-let inworldTokenSaveTimer = 0;
+let enginePollTimer = 0;
+let voicesLoadedFromEngine = false;
 
 function logDebug(event, details = {}) {
   console.log(`${LOG_PREFIX} ${event}`, details);
@@ -44,58 +41,48 @@ function persistDebugEvent(source, event, details = {}) {
   );
 }
 
-function isSupportedModelId(modelId) {
-  return SUPPORTED_MODEL_IDS.has(modelId);
+// ── Speed slider helpers ────────────────────────────────────────────
+// Snap to one decimal in [0.5, 2.0] so storage stays clean even if the
+// range input reports float drift (e.g. 0.7000000000000001).
+function snapSpeed(value) {
+  const raw = parseFloat(value);
+  const safe = Number.isFinite(raw) ? raw : 1.0;
+  const clamped = Math.max(SPEED_MIN, Math.min(SPEED_MAX, safe));
+  return Math.round(clamped * 10) / 10;
 }
 
-// Legacy ElevenLabs voice IDs were long 20-char hashes; Inworld voices are short names.
-// If storage still holds a stale ElevenLabs hash, swap it for the default Inworld voice.
-function looksLikeLegacyVoiceId(voiceId) {
-  return typeof voiceId === 'string' && voiceId.length > 15;
+function formatSpeedLabel(speed) {
+  return `${speed.toFixed(1)}×`;
 }
 
-// Load saved settings
-chrome.storage.local.get(
-  ['modelId', 'defaultVoice', 'defaultSpeed', 'articleMode', INWORLD_KEY_NAME],
-  (data) => {
-    const storageError = chrome.runtime.lastError?.message || null;
-    if (storageError) {
-      logDebug('settings-load-failed', { error: storageError });
-      showStatus('Could not load settings');
-      return;
-    }
-    const savedInworldKey = data[INWORLD_KEY_NAME] || '';
+function renderSpeed(speed) {
+  speedSlider.value = speed.toString();
+  speedValueEl.textContent = formatSpeedLabel(speed);
+}
 
-    logDebug('settings-loaded', {
-      hasInworldKey: Boolean(savedInworldKey),
-      modelId: data.modelId || null,
-      defaultVoice: data.defaultVoice || null,
-      defaultSpeed: data.defaultSpeed || null,
-      articleMode: data.articleMode,
-    });
-    if (savedInworldKey) inworldTokenInput.value = savedInworldKey;
-
-    const effectiveModelId = isSupportedModelId(data.modelId) ? data.modelId : DEFAULT_MODEL_ID;
-    modelSelect.value = effectiveModelId;
-    if (data.modelId && data.modelId !== effectiveModelId) {
-      logDebug('stale-model-reset', { from: data.modelId, to: effectiveModelId });
-      chrome.storage.local.set({ modelId: effectiveModelId });
-    }
-
-    let effectiveVoice = data.defaultVoice || DEFAULT_VOICE_ID;
-    if (looksLikeLegacyVoiceId(effectiveVoice)) {
-      logDebug('stale-voice-reset-on-load', { from: data.defaultVoice, to: DEFAULT_VOICE_ID });
-      effectiveVoice = DEFAULT_VOICE_ID;
-      chrome.storage.local.set({ defaultVoice: effectiveVoice });
-    }
-
-    if (data.defaultSpeed) speedSelect.value = data.defaultSpeed;
-    if (data.articleMode !== undefined) articleToggle.checked = data.articleMode;
-
-    ensureVoiceOption(effectiveVoice, 'Default Voice');
-    loadVoices(effectiveVoice);
+// ── Load saved settings ─────────────────────────────────────────────
+chrome.storage.local.get(['defaultVoice', 'defaultSpeed', 'articleMode'], (data) => {
+  const storageError = chrome.runtime.lastError?.message || null;
+  if (storageError) {
+    logDebug('settings-load-failed', { error: storageError });
+    showStatus('Could not load settings');
+    return;
   }
-);
+
+  logDebug('settings-loaded', {
+    defaultVoice: data.defaultVoice || null,
+    defaultSpeed: data.defaultSpeed || null,
+    articleMode: data.articleMode,
+  });
+
+  const effectiveVoice = data.defaultVoice || DEFAULT_VOICE_ID;
+  renderSpeed(snapSpeed(data.defaultSpeed ?? 1.0));
+  if (data.articleMode !== undefined) articleToggle.checked = data.articleMode;
+
+  ensureVoiceOption(effectiveVoice, 'Saved voice');
+  refreshEngineStatus();
+  loadVoices(effectiveVoice);
+});
 
 function showStatus(msg) {
   statusEl.textContent = msg;
@@ -111,14 +98,6 @@ function save(key, value) {
   chrome.storage.local.set({ [key]: value }, () => {
     const error = chrome.runtime.lastError?.message || null;
     showStatus(error ? 'Could not save setting' : 'Saved');
-  });
-}
-
-function saveInworldApiKey(value) {
-  logDebug('save-inworld-api-key', { hasInworldKey: Boolean(value) });
-  chrome.storage.local.set({ [INWORLD_KEY_NAME]: value }, () => {
-    const error = chrome.runtime.lastError?.message || null;
-    showStatus(error ? 'Could not save Inworld API key' : 'Saved');
   });
 }
 
@@ -152,19 +131,20 @@ function loadVoices(selectedVoice) {
     logDebug('voices-response', {
       ok: Boolean(response?.ok),
       error: response?.error || null,
-      status: response?.status || null,
       voiceCount: response?.voices?.length || 0,
       elapsedMs: Math.round(performance.now() - startedAt),
       runtimeError: chrome.runtime.lastError?.message || null,
     });
     if (chrome.runtime.lastError || !response || !response.ok || !response.voices?.length) {
-      ensureVoiceOption(selectedVoice || DEFAULT_VOICE_ID, 'Default Voice');
+      // Model probably still downloading — the engine-status poll retries
+      // loadVoices once the engine reports ready.
+      ensureVoiceOption(selectedVoice || DEFAULT_VOICE_ID, 'Default voice');
       return;
     }
 
     const groups = new Map();
     for (const voice of response.voices) {
-      const category = voice.category || 'Global';
+      const category = voice.category || 'Other';
       if (!groups.has(category)) groups.set(category, []);
       groups.get(category).push(voice);
     }
@@ -183,6 +163,7 @@ function loadVoices(selectedVoice) {
     }
 
     voiceSelect.replaceChildren(fragment);
+    voicesLoadedFromEngine = true;
     const effectiveVoiceId = Array.from(voiceSelect.options).some((option) => option.value === selectedVoice)
       ? selectedVoice
       : DEFAULT_VOICE_ID;
@@ -197,14 +178,42 @@ function loadVoices(selectedVoice) {
   });
 }
 
-function saveInworldTokenSoon() {
-  clearTimeout(inworldTokenSaveTimer);
-  inworldTokenSaveTimer = setTimeout(() => {
-    saveInworldApiKey(inworldTokenInput.value.trim());
-    inworldTokenSaveTimer = 0;
-  }, 250);
+// ── Engine status ───────────────────────────────────────────────────
+function scheduleEnginePoll() {
+  clearTimeout(enginePollTimer);
+  enginePollTimer = setTimeout(refreshEngineStatus, ENGINE_POLL_MS);
 }
 
+function refreshEngineStatus() {
+  chrome.runtime.sendMessage({ type: 'engine-status-request' }, (resp) => {
+    const runtimeError = chrome.runtime.lastError?.message || null;
+    if (runtimeError || !resp || !resp.ok) {
+      engineStatusEl.textContent = 'Engine unavailable — system voice will be used';
+      logDebug('engine-status-failed', { error: runtimeError || resp?.error || 'no-response' });
+      return;
+    }
+    switch (resp.status) {
+      case 'downloading':
+        engineStatusEl.textContent = `Downloading voice model — ${resp.progress || 0}%`;
+        scheduleEnginePoll();
+        break;
+      case 'ready':
+        engineStatusEl.textContent = resp.device === 'webgpu'
+          ? 'Ready — on-device (GPU)'
+          : 'Ready — on-device (CPU)';
+        if (!voicesLoadedFromEngine) loadVoices(voiceSelect.value || DEFAULT_VOICE_ID);
+        break;
+      case 'error':
+        engineStatusEl.textContent = `Engine error: ${resp.error || 'unknown'}`;
+        break;
+      default: // 'idle' — engine starts loading on first request
+        engineStatusEl.textContent = 'Starting voice engine…';
+        scheduleEnginePoll();
+    }
+  });
+}
+
+// ── Debug log actions ───────────────────────────────────────────────
 function formatDebugEntries(entries) {
   return entries
     .map((entry) => {
@@ -249,110 +258,57 @@ function clearDebugLog() {
   });
 }
 
-function describeVoiceCount(voicesResponse) {
-  if (!voicesResponse?.ok) return 'voices: error';
-  const count = voicesResponse.voices?.length || 0;
-  return `voices: ${count}`;
-}
-
 function showInPreview(lines) {
   debugPreview.style.display = 'block';
   debugPreview.textContent = lines.join('\n');
 }
 
-async function runApiSelfTest() {
+// ── Test voice ──────────────────────────────────────────────────────
+function testVoice() {
+  testVoiceBtn.disabled = true;
+  testVoiceBtn.textContent = 'Synthesizing…';
+  const voice = voiceSelect.value || DEFAULT_VOICE_ID;
+  const speed = snapSpeed(speedSlider.value);
   const startedAt = performance.now();
-  testApiBtn.disabled = true;
-  testApiBtn.textContent = 'Testing...';
-  showInPreview(['Running Inworld API self-test...']);
-  showStatus('Testing Inworld API');
-
-  const apiKey = inworldTokenInput.value.trim();
-  if (!apiKey) {
-    showInPreview([
-      'No API key set.',
-      'Enter your Inworld key first (Studio → API Keys, base64-encoded).',
-    ]);
-    showStatus('No API key');
-    testApiBtn.disabled = false;
-    testApiBtn.textContent = 'Test Inworld API';
-    return;
-  }
-
-  const voicesResponse = await new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type: 'voices-request' }, (resp) => {
-      resolve(resp || { ok: false, error: chrome.runtime.lastError?.message || 'no-response' });
-    });
-  });
-
-  let voiceForTest = voiceSelect.value || DEFAULT_VOICE_ID;
-  if (voicesResponse?.ok && voicesResponse.voices?.length) {
-    const englishVoice = voicesResponse.voices.find(
-      (v) => (v.category || '').toLowerCase().startsWith('en')
-    );
-    if (englishVoice) voiceForTest = englishVoice.voiceId;
-  }
-
-  const ttsResponse = await new Promise((resolve) => {
-    chrome.runtime.sendMessage(
-      { type: 'tts-request', text: 'Inworld self-test ok.', voice: voiceForTest, speed: 1 },
-      (resp) => resolve(resp || { ok: false, error: chrome.runtime.lastError?.message || 'no-response' })
-    );
-  });
-
-  const lines = [
-    `Elapsed: ${Math.round(performance.now() - startedAt)} ms`,
-    `Model: ${modelSelect.value}`,
-    `Voice tried: ${voiceForTest}`,
-    '',
-    `Voices fetch: ${voicesResponse?.ok ? 'OK' : 'FAIL'} — ${describeVoiceCount(voicesResponse)}`,
-  ];
-  if (!voicesResponse?.ok) {
-    lines.push(`  error: ${voicesResponse?.error || 'unknown'}`);
-    if (voicesResponse?.status) lines.push(`  http: ${voicesResponse.status}`);
-    if (voicesResponse?.detail) lines.push(`  detail: ${voicesResponse.detail}`);
-  } else if (voicesResponse.voices?.length) {
-    lines.push(`  sample: ${voicesResponse.voices.slice(0, 5).map((v) => v.voiceId).join(', ')}`);
-  }
-  lines.push('');
-  lines.push(`TTS synth: ${ttsResponse?.ok ? 'OK' : 'FAIL'}`);
-  if (!ttsResponse?.ok) {
-    lines.push(`  error: ${ttsResponse?.error || 'unknown'}`);
-    if (ttsResponse?.status) lines.push(`  http: ${ttsResponse.status}`);
-    if (ttsResponse?.detail) lines.push(`  detail: ${ttsResponse.detail}`);
-  } else {
-    const head = (ttsResponse.audioDataUrl || '').slice(0, 48);
-    lines.push(`  audio prefix: ${head}...`);
-    lines.push(`  base64 length: ${(ttsResponse.audioDataUrl?.length || 0)}`);
-  }
-
-  showInPreview(lines);
-  showStatus(ttsResponse?.ok ? 'Inworld API OK' : 'Inworld API failed');
-  testApiBtn.disabled = false;
-  testApiBtn.textContent = 'Test Inworld API';
+  chrome.runtime.sendMessage(
+    { type: 'tts-request', text: 'This is your Kokoro voice.', voice, speed },
+    (resp) => {
+      const runtimeError = chrome.runtime.lastError?.message || null;
+      testVoiceBtn.disabled = false;
+      testVoiceBtn.textContent = 'Test Voice';
+      if (runtimeError || !resp?.ok || !resp.audioDataUrl) {
+        const reason = resp?.error === 'model-loading'
+          ? `Model still downloading (${resp.progress || 0}%).`
+          : (resp?.detail || resp?.error || runtimeError || 'no response');
+        showInPreview([`Test failed: ${reason}`]);
+        showStatus('Test failed');
+        refreshEngineStatus();
+        return;
+      }
+      showInPreview([
+        `Synthesized in ${Math.round(performance.now() - startedAt)} ms`,
+        `Voice: ${voice}  Speed: ${formatSpeedLabel(speed)}`,
+        `Audio: ${Math.round(resp.audioDataUrl.length / 1024)} KB (base64 WAV)`,
+      ]);
+      new Audio(resp.audioDataUrl).play().catch((err) => {
+        showStatus(`Playback failed: ${err?.message || err}`);
+      });
+      showStatus('Playing test voice');
+    }
+  );
 }
 
-inworldTokenInput.addEventListener('input', saveInworldTokenSoon);
-inworldTokenInput.addEventListener('blur', () => {
-  clearTimeout(inworldTokenSaveTimer);
-  saveInworldApiKey(inworldTokenInput.value.trim());
-  inworldTokenSaveTimer = 0;
-  loadVoices(voiceSelect.value || DEFAULT_VOICE_ID);
-});
-
-modelSelect.addEventListener('change', () => save('modelId', modelSelect.value));
+// ── Event wiring ────────────────────────────────────────────────────
 voiceSelect.addEventListener('change', () => save('defaultVoice', voiceSelect.value));
-speedSelect.addEventListener('change', () => {
-  // Snap to nearest 0.05 detent in [0.5, 1.5] so storage stays clean
-  // even when the user types a value the spinner wouldn't have stopped at.
-  const raw = parseFloat(speedSelect.value);
-  const safe = Number.isFinite(raw) ? raw : 1.0;
-  const clamped = Math.max(0.5, Math.min(1.5, safe));
-  const snapped = Math.round(clamped * 20) / 20;
-  speedSelect.value = snapped.toString();
+speedSlider.addEventListener('input', () => {
+  speedValueEl.textContent = formatSpeedLabel(snapSpeed(speedSlider.value));
+});
+speedSlider.addEventListener('change', () => {
+  const snapped = snapSpeed(speedSlider.value);
+  renderSpeed(snapped);
   save('defaultSpeed', snapped.toString());
 });
 articleToggle.addEventListener('change', () => save('articleMode', articleToggle.checked));
 copyDebugLogBtn.addEventListener('click', copyDebugLog);
 clearDebugLogBtn.addEventListener('click', clearDebugLog);
-testApiBtn.addEventListener('click', runApiSelfTest);
+testVoiceBtn.addEventListener('click', testVoice);

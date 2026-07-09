@@ -34,6 +34,10 @@
       border-radius: 4px;
       font-size: 13px;
     }
+    input[type="range"] {
+      width: 100%;
+      accent-color: #7c5cbf;
+    }
     .hint {
       font-size: 11px;
       color: #999;
@@ -146,30 +150,20 @@
   <h1>Highlighter TTS</h1>
 
   <div class="field">
-    <label for="inworldApiToken">Inworld API Key</label>
-    <input type="password" id="inworldApiToken" placeholder="Enter Inworld key...">
-    <div class="hint" id="providerHint">Your Inworld API key for high-quality TTS.</div>
+    <label>Voice Engine</label>
+    <div class="hint" id="engineStatus">Checking engine…</div>
   </div>
 
   <div class="field">
-    <label for="modelId">TTS Model</label>
-    <select id="modelId">
-      <option value="inworld-tts-1.5-max">Max (High Quality)</option>
-      <option value="inworld-tts-1.5-mini">Mini (Fast &amp; Efficient)</option>
-    </select>
-    <div class="hint" id="modelHint">Model options for Inworld AI.</div>
-  </div>
-
-  <div class="field">
-    <label for="defaultVoice">Default Voice</label>
+    <label for="defaultVoice">Voice</label>
     <select id="defaultVoice"></select>
-    <div class="hint" id="voiceHint">Dropdown shows voices returned by the Inworld API.</div>
+    <div class="hint" id="voiceHint">Voices run on-device via Kokoro — nothing to configure.</div>
   </div>
 
   <div class="field">
-    <label for="defaultSpeed">Default Speed</label>
-    <input type="number" id="defaultSpeed" min="0.5" max="1.5" step="0.05" value="1.0">
-    <div class="hint">0.5x – 1.5x in 0.05 increments. Server-side speakingRate.</div>
+    <label for="defaultSpeed">Speed: <span id="speedValue">1.0×</span></label>
+    <input type="range" id="defaultSpeed" min="0.5" max="2" step="0.1" value="1">
+    <div class="hint">0.5× – 2.0× — applied during synthesis, not playback.</div>
   </div>
 
   <div class="toggle-row">
@@ -183,7 +177,7 @@
   <div class="status" id="status"></div>
 
   <div class="debug-actions">
-    <button type="button" id="testApiBtn">Test Inworld API</button>
+    <button type="button" id="testVoiceBtn">Test Voice</button>
     <button type="button" id="copyDebugLog">Copy Debug Log</button>
     <button type="button" id="clearDebugLog">Clear Log</button>
   </div>
