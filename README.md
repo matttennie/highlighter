@@ -2,13 +2,20 @@
 
 `Highlighter TTS` is a Chrome extension that lets you paint over text on a page and hear it read aloud.
 
+## How it works
+
+All speech is generated on your device by the Kokoro-82M model — no API
+key, no cloud calls, no per-use cost. On first use the extension downloads
+the voice model (~90 MB, cached permanently); until it finishes, playback
+falls back to your system voice.
+
 ## Features
 
 - **Highlight Mode:** Brush-style cursor for intuitive text selection.
 - **Floating Transport:** Play, pause, skip, and adjust settings from a draggable in-page player.
-- **TTS Integration:** High-quality speech via Inworld AI (TTS 1.5 Max/Mini).
-- **Voice Management:** Dynamic voice list fetched from the Inworld API.
-- **Robustness:** Built-in fallbacks to browser `speechSynthesis` when API limits are hit or CSP blocks external audio.
+- **On-Device TTS:** Speech synthesized locally by the Kokoro-82M model — no API key, no cloud calls, no per-use cost.
+- **Voice Management:** Grouped list of on-device Kokoro voices with adjustable playback speed.
+- **Robustness:** Falls back to the browser's `speechSynthesis` while the voice model is still downloading or if on-device synthesis fails.
 
 ## Stability & Robustness
 
@@ -20,10 +27,11 @@ This extension is built for production-grade reliability:
 
 ## Setup
 
-1. Install dependencies:
+1. Install dependencies and build the offscreen TTS engine:
 
 ```bash
 npm install
+npm run build
 ```
 
 2. Load the extension in Chrome:
@@ -33,7 +41,8 @@ npm install
 - Click `Load unpacked`
 - Select this folder
 
-3. Open the extension popup and paste an Inworld API key.
+No API key or account is required. The first time you use the extension it
+downloads the Kokoro voice model (~90 MB) and caches it permanently.
 
 ## Usage
 
@@ -43,17 +52,14 @@ npm install
 
 ## Development
 
-- Run tests:
-
 ```bash
-npm test
+npm install
+npm run build   # bundles the offscreen TTS engine (required before loading)
+npm test        # unit tests
 ```
 
-- End-to-end extension check with Playwright:
-
-```bash
-INWORLD_API_KEY=your_key node tests/playwright-extension-check.mjs
-```
+Load the extension unpacked from the repo root (chrome://extensions →
+Developer mode → Load unpacked) after running the build.
 
 ## License
 

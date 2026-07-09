@@ -65,7 +65,7 @@ export async function startTestServer() {
   };
 }
 
-export async function launchExtension({ apiKey, startedAt, profilePrefix = 'highlighter-e2e-' }) {
+export async function launchExtension({ startedAt, profilePrefix = 'highlighter-e2e-' }) {
   const userDataDir = await mkdtemp(path.join(os.tmpdir(), profilePrefix));
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless: false,
@@ -94,17 +94,12 @@ export async function launchExtension({ apiKey, startedAt, profilePrefix = 'high
   const popupPage = await context.newPage();
   attachHighlighterConsole(popupPage, '[popup]', startedAt);
   await popupPage.goto(`chrome-extension://${extensionId}/popup/popup.html`);
-  await popupPage.evaluate(
-    async ({ key }) => {
-      await chrome.storage.local.set({
-        inworld_Highlighter_API_Key: key,
-        modelId: 'inworld-tts-1.5-max',
-        defaultVoice: 'Sarah',
-        defaultSpeed: '1',
-      });
-    },
-    { key: apiKey }
-  );
+  await popupPage.evaluate(async () => {
+    await chrome.storage.local.set({
+      defaultVoice: 'af_heart',
+      defaultSpeed: '1',
+    });
+  });
   await popupPage.reload();
 
   return {

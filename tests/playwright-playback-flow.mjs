@@ -1,4 +1,3 @@
-import process from 'node:process';
 import {
   launchExtension,
   startTestServer,
@@ -6,17 +5,10 @@ import {
   toggleActiveTabFromServiceWorker,
 } from './extension-harness.mjs';
 
-const apiKey = process.env.INWORLD_API_KEY;
 const startedAt = Date.now();
-
-if (!apiKey) {
-  console.error('INWORLD_API_KEY is required');
-  process.exit(1);
-}
 
 const server = await startTestServer();
 const extension = await launchExtension({
-  apiKey,
   startedAt,
   profilePrefix: 'highlighter-playback-',
 });

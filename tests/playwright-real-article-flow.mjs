@@ -5,19 +5,12 @@ import {
   toggleActiveTabFromServiceWorker,
 } from './extension-harness.mjs';
 
-const apiKey = process.env.INWORLD_API_KEY;
 const startedAt = Date.now();
 const articleUrl =
   process.env.HIGHLIGHTER_REAL_ARTICLE_URL ||
   'https://developer.chrome.com/blog/longer-esw-lifetimes';
 
-if (!apiKey) {
-  console.error('INWORLD_API_KEY is required');
-  process.exit(1);
-}
-
 const extension = await launchExtension({
-  apiKey,
   startedAt,
   profilePrefix: 'highlighter-real-article-',
 });
