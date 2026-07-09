@@ -67,6 +67,24 @@ describe('popup.js', () => {
     assert.doesNotMatch(popupJs, /apiKey|API key/i);
     assert.doesNotMatch(popupJs, /modelId/);
   });
+
+  it('reports the WASM thread count when the origin is isolated', () => {
+    assert.match(popupJs, /CPU, \$\{resp\.threads \|\| '\?'\} threads/);
+  });
+
+  it('warns that single-thread mode is slow when not isolated', () => {
+    assert.match(popupJs, /resp\.isolated === false/);
+    assert.match(popupJs, /single-thread — slow/);
+  });
+
+  it('drops the stale GPU status branch (device is always CPU now)', () => {
+    assert.doesNotMatch(popupJs, /on-device \(GPU\)/);
+  });
+
+  it('says "Waking up" instead of "Downloading" when weights are warm', () => {
+    assert.match(popupJs, /resp\.warm/);
+    assert.match(popupJs, /Waking up voice engine — \$\{resp\.progress \|\| 0\}%/);
+  });
 });
 
 describe('snapSpeed (popup mirror)', () => {

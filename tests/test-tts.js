@@ -455,4 +455,64 @@ describe('content.js race-condition & policy contracts', () => {
   it('polls engine status while loading for the download-progress tooltip', () => {
     assert.match(contentJs, /Downloading voice model — \$\{status\.progress\}%/);
   });
+
+  it('switches the loading tooltip to "Waking up" when the engine is warm', () => {
+    assert.match(contentJs, /Waking up voice engine — \$\{status\.progress\}%/);
+  });
+});
+
+// ── Wave B: tts-cancel protocol source contracts (mirrors content.js) ──
+describe('content.js tts-cancel protocol contracts', () => {
+  const contentJs = fs.readFileSync(path.join(rootDir, 'content', 'content.js'), 'utf8');
+
+  it('mints a monotonic clientRequestId and tracks inflight ids', () => {
+    assert.match(contentJs, /let ttsClientSeq = 0/);
+    assert.match(contentJs, /const inflightTtsIds = new Set\(\)/);
+    assert.match(contentJs, /const clientRequestId = \+\+ttsClientSeq/);
+  });
+
+  it('stamps every tts-request with the clientRequestId and tracks it in the set', () => {
+    // Both playSentence and prefetchSentence add before sending and delete in the callback.
+    const adds = contentJs.match(/inflightTtsIds\.add\(clientRequestId\)/g) || [];
+    const deletes = contentJs.match(/inflightTtsIds\.delete\(clientRequestId\)/g) || [];
+    assert.equal(adds.length, 2, 'both playSentence and prefetchSentence must add the id');
+    assert.equal(deletes.length, 2, 'both callbacks must remove the id');
+    assert.match(contentJs, /type: 'tts-request', text, voice, speed, clientRequestId/);
+  });
+
+  it('defines cancelInflightTts as a fire-and-forget tts-cancel sender', () => {
+    assert.match(contentJs, /function cancelInflightTts\(\)/);
+    assert.match(contentJs, /type: 'tts-cancel', clientRequestIds/);
+    assert.match(contentJs, /inflightTtsIds\.clear\(\)/);
+  });
+
+  it('cancels inflight synths from stopPlayback', () => {
+    assert.match(
+      contentJs,
+      /function stopPlayback\(\)\s*\{[\s\S]*?cancelInflightTts\(\)[\s\S]*?setPlaybackState\('idle'\)/,
+    );
+  });
+
+  it('cancels inflight synths when the audio cache is invalidated', () => {
+    assert.match(
+      contentJs,
+      /function invalidateAudioCache\(reason\)\s*\{\s*[\s\S]*?cancelInflightTts\(\)/,
+    );
+  });
+
+  it('cancels the timed-out request inside the responseTimeout handler', () => {
+    const timeoutHandler = contentJs.match(
+      /const responseTimeout = setTimeout\(\(\) => \{([\s\S]*?)\}, TTS_TIMEOUT_MS\);/,
+    );
+    assert.ok(timeoutHandler, 'responseTimeout handler not found');
+    assert.match(timeoutHandler[1], /pbRequestId\+\+;[\s\S]*?cancelInflightTts\(\)/);
+  });
+
+  it('cancels the superseded synth on the skip (cache-miss) path before re-sending', () => {
+    // navigateSentence cancels OLD ids before the debounced settle mints a NEW one.
+    assert.match(
+      contentJs,
+      /function navigateSentence\(delta\)\s*\{[\s\S]*?cancelInflightTts\(\)[\s\S]*?skipDebounceTimer = setTimeout/,
+    );
+  });
 });

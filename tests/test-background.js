@@ -67,6 +67,38 @@ describe('offscreen routing', () => {
   });
 });
 
+describe('tts-cancel routing (Wave B)', () => {
+  it('renames the onMessage listener sender param so tab scoping can read it', () => {
+    assert.match(backgroundJs, /chrome\.runtime\.onMessage\.addListener\(\(msg, sender, sendResponse\)/);
+  });
+
+  it('has a tts-cancel route that responds ok immediately', () => {
+    assert.match(backgroundJs, /msg\.type === 'tts-cancel'/);
+  });
+
+  it('scopes client request ids per tab (both tts-request and tts-cancel)', () => {
+    assert.match(backgroundJs, /\$\{sender\.tab\?\.id \?\? 'x'\}:\$\{/);
+    // tts-request forwards a scoped clientRequestId to the offscreen doc.
+    assert.match(backgroundJs, /const clientRequestId = msg\.clientRequestId \?/);
+    assert.match(backgroundJs, /handleTtsRequest\(msg, requestId, clientRequestId\)/);
+  });
+
+  it('does not create the offscreen document just to deliver a cancel', () => {
+    const cancelRoute = backgroundJs.match(/if \(msg\.type === 'tts-cancel'\) \{([\s\S]*?)\n {2}\}/);
+    assert.ok(cancelRoute, 'tts-cancel route not found');
+    assert.doesNotMatch(cancelRoute[1], /ensureOffscreenDocument/);
+    assert.match(cancelRoute[1], /forwardCancelToOffscreen/);
+  });
+
+  it('forwards a cancel only when an offscreen document already exists', () => {
+    const helper = backgroundJs.match(/async function forwardCancelToOffscreen\([\s\S]*?\n\}/);
+    assert.ok(helper, 'forwardCancelToOffscreen helper not found');
+    assert.match(helper[0], /getContexts\(\{ contextTypes: \['OFFSCREEN_DOCUMENT'\] \}\)/);
+    assert.match(helper[0], /contexts\.length === 0\) return/);
+    assert.doesNotMatch(helper[0], /ensureOffscreenDocument/);
+  });
+});
+
 describe('normalizeSpeed', () => {
   it('defaults invalid values to 1x', () => {
     assert.equal(normalizeSpeed(undefined), 1);

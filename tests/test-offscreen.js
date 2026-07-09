@@ -52,7 +52,57 @@ describe('offscreen document', () => {
 
   it('guards ORT threading on crossOriginIsolated', () => {
     assert.match(engineJs, /crossOriginIsolated/);
-    assert.match(engineJs, /numThreads = 1/);
+  });
+});
+
+describe('offscreen WASM threading (Wave B)', () => {
+  it('uncaps threads on isolated origins via (hardwareConcurrency || 4) - 1', () => {
+    assert.match(engineJs, /const wasmThreads = globalThis\.crossOriginIsolated/);
+    assert.match(engineJs, /Math\.max\(1, \(navigator\.hardwareConcurrency \|\| 4\) - 1\)/);
+  });
+
+  it('forces a single thread when the origin is not cross-origin isolated', () => {
+    assert.match(
+      engineJs,
+      /crossOriginIsolated\s*\?\s*Math\.max\(1, \(navigator\.hardwareConcurrency \|\| 4\) - 1\)\s*:\s*1;/,
+    );
+    assert.match(engineJs, /env\.backends\.onnx\.wasm\.numThreads = wasmThreads/);
+  });
+
+  it('reports isolation and thread count in the engine-status response', () => {
+    assert.match(engineJs, /isolated: globalThis\.crossOriginIsolated === true/);
+    assert.match(engineJs, /threads: wasmThreads/);
+  });
+});
+
+describe('offscreen tts-cancel protocol (Wave B)', () => {
+  it('maintains a cancelledIds set with a size guard', () => {
+    assert.match(engineJs, /const cancelledIds = new Set\(\)/);
+    assert.match(engineJs, /cancelledIds\.size > 500/);
+  });
+
+  it('records ids from a tts-cancel message', () => {
+    assert.match(engineJs, /msg\.type === 'tts-cancel'/);
+    assert.match(engineJs, /cancelledIds\.add\(id\)/);
+  });
+
+  it('captures the clientRequestId and skips a cancelled job before generating', () => {
+    assert.match(engineJs, /const id = msg\.clientRequestId/);
+    assert.match(engineJs, /if \(id && cancelledIds\.has\(id\)\)/);
+    assert.match(engineJs, /error: 'cancelled'/);
+  });
+});
+
+describe('offscreen warmup + warm-status (Wave B)', () => {
+  it('warms with the stored voice, not only the hardcoded default', () => {
+    assert.match(engineJs, /chrome\.storage\.local\.get\(\['defaultVoice'\]/);
+    assert.match(engineJs, /resolveVoice\(storedVoice \|\| DEFAULT_VOICE_ID\)/);
+  });
+
+  it('persists kokoroLoadedOnce and exposes warm status', () => {
+    assert.match(engineJs, /chrome\.storage\.local\.set\(\{ kokoroLoadedOnce: true \}/);
+    assert.match(engineJs, /getKokoroLoadedOnce/);
+    assert.match(engineJs, /warm/);
   });
 });
 

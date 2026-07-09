@@ -55,6 +55,13 @@
   let cachedVoice   = DEFAULT_VOICE_ID; // FIX 8: use constant
   let cachedSpeed   = 1.2;
 
+  // Wave B: request-cancellation protocol. Every tts-request carries a unique
+  // clientRequestId; when a request is superseded (skip, new stroke, timeout,
+  // voice/speed change) we tell the offscreen synth queue to skip it so it never
+  // spends 3-7s synthesizing audio nobody is waiting for.
+  let ttsClientSeq = 0;
+  const inflightTtsIds = new Set();
+
   // Session-level fallback policy (A4): after two engine failures (timeout or
   // error) in one reading session, stop hitting the engine and read the rest
   // with the system voice. Reset on a new stroke and on a successful Kokoro
@@ -897,6 +904,10 @@
     releaseCurrentAudioElement();
     if (window.speechSynthesis) window.speechSynthesis.cancel();
     pbRequestId++; // invalidate any in-flight playback request
+    // Wave B: cancel the superseded synth now, BEFORE the debounced settle path
+    // mints a new clientRequestId in playSentence — so we skip the request we're
+    // abandoning without ever cancelling the one we're about to send.
+    cancelInflightTts();
     setPlaybackState('loading');
 
     pendingSkipTarget = newIdx;
@@ -940,6 +951,10 @@
   }
 
   function invalidateAudioCache(reason) {
+    // Any synth still in flight for the old voice/speed/stroke is now stale —
+    // cancel it before the early-return, since the cache/prefetch maps can be
+    // empty while a foreground playSentence request is still queued offscreen.
+    cancelInflightTts();
     if (audioCache.size === 0 && pendingPrefetch.size === 0) return;
     logDebug('audio-cache-invalidated', { reason, cached: audioCache.size, pending: pendingPrefetch.size });
     audioCache.clear();
@@ -949,6 +964,22 @@
   function cancelAllPrefetches() {
     prefetchGeneration++; // any in-flight prefetch responses will check this and discard
     pendingPrefetch.clear();
+  }
+
+  // Wave B: tell the offscreen synth queue to skip requests we no longer want.
+  // Fire-and-forget — the background drops the cancel entirely if the offscreen
+  // document isn't running, and a stale/duplicate id is harmless on the far end.
+  function cancelInflightTts() {
+    if (inflightTtsIds.size === 0) return;
+    const clientRequestIds = [...inflightTtsIds];
+    inflightTtsIds.clear();
+    try {
+      chrome.runtime.sendMessage({ type: 'tts-cancel', clientRequestIds }, () => {
+        void chrome.runtime.lastError;
+      });
+    } catch (e) {
+      // Extension context invalidated — nothing left to cancel against.
+    }
   }
 
   function currentVoiceForPlayback() {
@@ -978,11 +1009,14 @@
 
     const text = pbSentences[idx].text;
     const startedAt = performance.now();
+    const clientRequestId = ++ttsClientSeq;
+    inflightTtsIds.add(clientRequestId);
     logDebug('prefetch-start', { idx, voice, speed, textLength: text.length });
 
     chrome.runtime.sendMessage(
-      { type: 'tts-request', text, voice, speed },
+      { type: 'tts-request', text, voice, speed, clientRequestId },
       (response) => {
+        inflightTtsIds.delete(clientRequestId);
         pendingPrefetch.delete(idx);
         const elapsedMs = Math.round(performance.now() - startedAt);
         if (token.cancelled || myGen !== prefetchGeneration) {
@@ -1042,7 +1076,10 @@
         const playBtn = playerEl.querySelector('.hltr-play-pause');
         if (!playBtn) return;
         if (status?.status === 'downloading' && typeof status.progress === 'number') {
-          playBtn.title = `Downloading voice model — ${status.progress}%`;
+          // Warm weights come from disk cache — that's a wake-up, not a download.
+          playBtn.title = status.warm
+            ? `Waking up voice engine — ${status.progress}%`
+            : `Downloading voice model — ${status.progress}%`;
         }
       });
     }, 1000);
@@ -1199,6 +1236,7 @@
       // entirely — deliberately NOT cache-warmed, because its stale closure `idx`
       // indexes the OLD pbSentences and would poison the cache after a new stroke.
       pbRequestId++;
+      cancelInflightTts(); // Wave B: skip the timed-out synth if it is still queued offscreen
       const fallbackId = pbRequestId;
       // A3: honest toast — ask the engine why it's slow (~100ms round-trip is
       // fine), then read with the system voice under the freshly-bumped id.
@@ -1215,9 +1253,12 @@
       });
     }, TTS_TIMEOUT_MS);
 
+    const clientRequestId = ++ttsClientSeq;
+    inflightTtsIds.add(clientRequestId);
     chrome.runtime.sendMessage(
-      { type: 'tts-request', text, voice, speed },
+      { type: 'tts-request', text, voice, speed, clientRequestId },
       (response) => {
+        inflightTtsIds.delete(clientRequestId);
         // FIX 7: Clear the timeout — we got a response
         clearTimeout(responseTimeout);
 
@@ -1457,6 +1498,7 @@
   function stopPlayback() {
     logDebug('playback-stop');
     pbRequestId++; // invalidate in-flight requests
+    cancelInflightTts(); // Wave B: skip any still-queued offscreen synths
     // FIX 3: Properly release audio resources
     releaseCurrentAudioElement();
     // FIX 2: Also cancel speechSynthesis when stopping

@@ -194,13 +194,18 @@ function refreshEngineStatus() {
     }
     switch (resp.status) {
       case 'downloading':
-        engineStatusEl.textContent = `Downloading voice model — ${resp.progress || 0}%`;
+        // Warm weights come from disk cache — that's a wake-up, not a download.
+        engineStatusEl.textContent = resp.warm
+          ? `Waking up voice engine — ${resp.progress || 0}%`
+          : `Downloading voice model — ${resp.progress || 0}%`;
         scheduleEnginePoll();
         break;
       case 'ready':
-        engineStatusEl.textContent = resp.device === 'webgpu'
-          ? 'Ready — on-device (GPU)'
-          : 'Ready — on-device (CPU)';
+        // Device is always CPU now. Surface the WASM thread count — single-thread
+        // (no cross-origin isolation, hence no SharedArrayBuffer) is much slower.
+        engineStatusEl.textContent = resp.isolated === false
+          ? 'Ready — on-device (CPU, single-thread — slow)'
+          : `Ready — on-device (CPU, ${resp.threads || '?'} threads)`;
         if (!voicesLoadedFromEngine) loadVoices(voiceSelect.value || DEFAULT_VOICE_ID);
         break;
       case 'error':

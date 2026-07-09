@@ -254,6 +254,17 @@ function sendToOffscreenOnce(message) {
   });
 }
 
+// Deliver a cancel to the offscreen document only if it already exists. A
+// cancel for a not-yet-running engine is meaningless (nothing is queued), and
+// spinning the document up just to cancel would defeat the purpose. Uses
+// getContexts directly — never ensureOffscreenDocument.
+async function forwardCancelToOffscreen(scopedIds) {
+  if (!scopedIds.length) return;
+  const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+  if (contexts.length === 0) return;
+  await sendToOffscreen({ type: 'tts-cancel', clientRequestIds: scopedIds });
+}
+
 // The offscreen document's large module bundle keeps evaluating after
 // createDocument() resolves; sends in that window fail with "Receiving end
 // does not exist". Retry briefly instead of surfacing a startup race.
@@ -271,7 +282,7 @@ async function sendToOffscreen(message) {
 }
 
 // ── Message router ──────────────────────────────────────────────────
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Offscreen-addressed messages are handled by the offscreen document's
   // own listener; both contexts share chrome.runtime.onMessage.
   if (msg && msg.target === 'offscreen') return false;
@@ -290,6 +301,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg.type === 'tts-request') {
     const requestId = ++requestSeq;
+    // Scope the caller's per-tab clientRequestId so ids from different tabs can't
+    // collide in the offscreen synth queue's cancellation set.
+    const clientRequestId = msg.clientRequestId ? `${sender.tab?.id ?? 'x'}:${msg.clientRequestId}` : undefined;
     logDebug('message-received', {
       requestId,
       type: msg.type,
@@ -297,7 +311,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       voice: msg.voice || null,
       speed: msg.speed || null,
     });
-    handleTtsRequest(msg, requestId)
+    handleTtsRequest(msg, requestId, clientRequestId)
       .then(sendResponse)
       .catch((err) => {
         console.error(`${LOG_PREFIX} Unhandled TTS error:`, {
@@ -308,6 +322,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         sendResponse({ ok: false, error: 'engine-error', detail: err.message });
       });
     return true; // keep channel open for async sendResponse
+  }
+
+  if (msg.type === 'tts-cancel') {
+    const rawIds = Array.isArray(msg.clientRequestIds) ? msg.clientRequestIds : [];
+    const scopedIds = rawIds.map((id) => `${sender.tab?.id ?? 'x'}:${id}`);
+    // Fire-and-forget. Never create the offscreen document just to cancel — if
+    // it isn't running there is nothing queued to skip.
+    forwardCancelToOffscreen(scopedIds).catch(() => {});
+    sendResponse({ ok: true });
+    return false;
   }
 
   if (msg.type === 'voices-request') {
@@ -361,7 +385,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 });
 
 // ── TTS request handler ─────────────────────────────────────────────
-async function handleTtsRequest({ text, voice, speed }, requestId = ++requestSeq) {
+async function handleTtsRequest({ text, voice, speed }, requestId = ++requestSeq, clientRequestId) {
   const startedAt = performance.now();
 
   const normalizedText = typeof text === 'string' ? text.trim() : '';
@@ -394,6 +418,7 @@ async function handleTtsRequest({ text, voice, speed }, requestId = ++requestSeq
     text: normalizedText,
     voice: voiceId,
     speed: normalizedSpeed,
+    clientRequestId,
   })) || { ok: false, error: 'no-response' };
 
   logDebug('tts-complete', {
