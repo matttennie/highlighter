@@ -261,6 +261,8 @@ function sendToOffscreenOnce(message) {
 async function forwardCancelToOffscreen(scopedIds) {
   if (!scopedIds.length) return;
   const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+  // Benign to drop: no offscreen document ⇒ the engine isn't running and nothing
+  // is queued, so there's no wasted synthesis for this cancel to prevent.
   if (contexts.length === 0) return;
   await sendToOffscreen({ type: 'tts-cancel', clientRequestIds: scopedIds });
 }

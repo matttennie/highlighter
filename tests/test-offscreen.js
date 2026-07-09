@@ -56,15 +56,15 @@ describe('offscreen document', () => {
 });
 
 describe('offscreen WASM threading (Wave B)', () => {
-  it('uncaps threads on isolated origins via (hardwareConcurrency || 4) - 1', () => {
+  it('raises threads on isolated origins but caps oversubscription at 8', () => {
     assert.match(engineJs, /const wasmThreads = globalThis\.crossOriginIsolated/);
-    assert.match(engineJs, /Math\.max\(1, \(navigator\.hardwareConcurrency \|\| 4\) - 1\)/);
+    assert.match(engineJs, /Math\.max\(1, Math\.min\(8, \(navigator\.hardwareConcurrency \|\| 4\) - 1\)\)/);
   });
 
   it('forces a single thread when the origin is not cross-origin isolated', () => {
     assert.match(
       engineJs,
-      /crossOriginIsolated\s*\?\s*Math\.max\(1, \(navigator\.hardwareConcurrency \|\| 4\) - 1\)\s*:\s*1;/,
+      /crossOriginIsolated\s*\?\s*Math\.max\(1, Math\.min\(8, \(navigator\.hardwareConcurrency \|\| 4\) - 1\)\)\s*:\s*1;/,
     );
     assert.match(engineJs, /env\.backends\.onnx\.wasm\.numThreads = wasmThreads/);
   });
@@ -76,9 +76,12 @@ describe('offscreen WASM threading (Wave B)', () => {
 });
 
 describe('offscreen tts-cancel protocol (Wave B)', () => {
-  it('maintains a cancelledIds set with a size guard', () => {
+  it('maintains a cancelledIds set with a size guard that trims (not clears) oldest ids', () => {
     assert.match(engineJs, /const cancelledIds = new Set\(\)/);
     assert.match(engineJs, /cancelledIds\.size > 500/);
+    // Trimming preserves ids added by the same message; a hard clear would drop them.
+    assert.doesNotMatch(engineJs, /cancelledIds\.clear\(\)/);
+    assert.match(engineJs, /cancelledIds\.delete\(it\.next\(\)\.value\)/);
   });
 
   it('records ids from a tts-cancel message', () => {
@@ -103,6 +106,11 @@ describe('offscreen warmup + warm-status (Wave B)', () => {
     assert.match(engineJs, /chrome\.storage\.local\.set\(\{ kokoroLoadedOnce: true \}/);
     assert.match(engineJs, /getKokoroLoadedOnce/);
     assert.match(engineJs, /warm/);
+  });
+
+  it('includes warm in the initial and error engineStatus shapes for cross-context uniformity', () => {
+    assert.match(engineJs, /status: 'idle',[^}]*warm: false/);
+    assert.match(engineJs, /status: 'error',[^}]*warm: false/);
   });
 });
 

@@ -18,11 +18,13 @@ const IDLE_CHECK_INTERVAL_MS = 60 * 1000;
 env.backends.onnx.wasm.wasmPaths = chrome.runtime.getURL('offscreen/ort/');
 // COOP/COEP in the manifest makes extension pages crossOriginIsolated,
 // unlocking SharedArrayBuffer so ONNX Runtime can use multiple threads.
-// ORT's default caps at min(4, cores/2). Uncap on isolated origins;
-// without isolation there is no SharedArrayBuffer, so force 1 thread
-// rather than letting ORT crash probing for it.
+// ORT's default caps at min(4, cores/2). Raise it on isolated origins but
+// cap at 8: this is an 82M-param model, and past ~8 threads the inter-thread
+// sync overhead plus extra WASM memory outweigh any throughput gain. Without
+// isolation there is no SharedArrayBuffer, so force 1 thread rather than
+// letting ORT crash probing for it.
 const wasmThreads = globalThis.crossOriginIsolated
-  ? Math.max(1, (navigator.hardwareConcurrency || 4) - 1)
+  ? Math.max(1, Math.min(8, (navigator.hardwareConcurrency || 4) - 1))
   : 1;
 env.backends.onnx.wasm.numThreads = wasmThreads;
 console.log(`${LOG_PREFIX} crossOriginIsolated=${globalThis.crossOriginIsolated} wasmThreads=${wasmThreads}`);
@@ -32,7 +34,7 @@ let tts = null;
 let initPromise = null;
 // Serializes synthesis: concurrent ONNX runs on one session degrade both.
 let synthQueue = Promise.resolve();
-let engineStatus = { status: 'idle', progress: 0, device: null, error: null };
+let engineStatus = { status: 'idle', progress: 0, device: null, error: null, warm: false };
 let lastActivityAt = Date.now();
 let activeSynths = 0;
 // Wave B: ids the content script asked us to skip. A queued synth job checks
@@ -126,7 +128,7 @@ function ensureEngine() {
     console.log(`${LOG_PREFIX} model ready`, { device: engineStatus.device, warm });
     return tts;
   })().catch((err) => {
-    engineStatus = { status: 'error', progress: 0, device: null, error: err?.message || String(err) };
+    engineStatus = { status: 'error', progress: 0, device: null, error: err?.message || String(err), warm: false };
     initPromise = null; // allow a retry on the next request
     throw err;
   });
@@ -224,9 +226,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === 'tts-cancel') {
     const ids = Array.isArray(msg.clientRequestIds) ? msg.clientRequestIds : [];
     for (const id of ids) cancelledIds.add(id);
-    // Bounded: a hard reset is fine because an id that never matched a queued
-    // job is harmless — worst case a not-yet-received cancel is forgotten.
-    if (cancelledIds.size > 500) cancelledIds.clear();
+    // Bounded: trim the OLDEST entries instead of clearing outright, so the ids
+    // this very message just added survive and can still skip their queued
+    // jobs. Sets iterate in insertion order, so the leading values are oldest.
+    if (cancelledIds.size > 500) {
+      const it = cancelledIds.values();
+      for (let n = cancelledIds.size - 250; n > 0; n--) cancelledIds.delete(it.next().value);
+    }
     sendResponse({ ok: true });
     return false;
   }

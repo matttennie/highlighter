@@ -468,7 +468,37 @@ describe('content.js tts-cancel protocol contracts', () => {
   it('mints a monotonic clientRequestId and tracks inflight ids', () => {
     assert.match(contentJs, /let ttsClientSeq = 0/);
     assert.match(contentJs, /const inflightTtsIds = new Set\(\)/);
-    assert.match(contentJs, /const clientRequestId = \+\+ttsClientSeq/);
+    assert.match(contentJs, /const clientRequestId = `\$\{ttsSessionNonce\}:\$\{\+\+ttsClientSeq\}`/);
+  });
+
+  it('I1: composes a per-load nonce into the id so it survives content-script reloads', () => {
+    // ttsClientSeq resets to 0 each load while the offscreen cancelled-id set
+    // outlives it; the nonce prevents a fresh id colliding with a stale cancel.
+    assert.match(contentJs, /const ttsSessionNonce = Math\.random\(\)\.toString\(36\)\.slice\(2, 8\)/);
+    // Both mint sites (playSentence + prefetchSentence) use the composed form.
+    const mints = contentJs.match(/`\$\{ttsSessionNonce\}:\$\{\+\+ttsClientSeq\}`/g) || [];
+    assert.equal(mints.length, 2, 'both playSentence and prefetchSentence must compose the nonce');
+  });
+
+  it('I2(a): recovers when a cancel reaches the current request instead of stalling', () => {
+    assert.match(contentJs, /let cancelledRetryCount = 0/);
+    assert.match(contentJs, /cancelledRetryCount < 2/);
+    assert.match(contentJs, /cancelledRetryCount\+\+;/);
+    // Cap exhausted → fall back to the system voice under a freshly-bumped id.
+    assert.match(contentJs, /fallbackSpeechSynthesis\(text, speed, \+\+pbRequestId\)/);
+  });
+
+  it('I2(b): re-issues the current sentence when a menu change cancels a queued load', () => {
+    // Both the speed slider and voice select re-issue when mid-load.
+    const reissues = contentJs.match(/if \(changed && pbState === 'loading'\) playSentence\(pbIndex\)/g) || [];
+    assert.equal(reissues.length, 2, 'speed slider and voice select must both re-issue on a cancelled load');
+  });
+
+  it('I3: model-loading is excluded from the session fallback latch', () => {
+    // !response.ok path: fall back for this sentence but don't count the latch.
+    assert.match(contentJs, /if \(response\?\.error !== 'model-loading'\) sessionFallbackCount\+\+;/);
+    // Timeout path: a 'downloading' engine status likewise doesn't latch.
+    assert.match(contentJs, /if \(!isDownloading\) sessionFallbackCount\+\+;/);
   });
 
   it('stamps every tts-request with the clientRequestId and tracks it in the set', () => {

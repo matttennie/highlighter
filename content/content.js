@@ -60,7 +60,19 @@
   // voice/speed change) we tell the offscreen synth queue to skip it so it never
   // spends 3-7s synthesizing audio nobody is waiting for.
   let ttsClientSeq = 0;
+  // Ids must be unique across content-script reloads in the same tab —
+  // the offscreen document's cancelled-id set outlives this script (up to
+  // 15 min), and ttsClientSeq resets to 0 on every load. Composing a
+  // per-load nonce into the id stops a fresh id from colliding with a
+  // lingering cancelled one after a same-tab navigation.
+  const ttsSessionNonce = Math.random().toString(36).slice(2, 8);
   const inflightTtsIds = new Set();
+
+  // Wave B (I2): when a cancel reaches the CURRENT still-wanted request (a
+  // voice/speed change that cancelled a queued foreground load), re-issue
+  // rather than stall in 'loading'. Bounded so a genuinely stuck engine
+  // falls back to the system voice instead of looping forever.
+  let cancelledRetryCount = 0;
 
   // Session-level fallback policy (A4): after two engine failures (timeout or
   // error) in one reading session, stop hitting the engine and read the rest
@@ -381,6 +393,7 @@
       // chance on this highlight even if the previous one gave up on it.
       sessionFallbackCount = 0;
       sessionFallbackToastShown = false;
+      cancelledRetryCount = 0;
 
       showPlayer();
     } catch (e) {
@@ -719,9 +732,14 @@
     const speedLbl = menuPanelEl.querySelector('.hltr-speed-label');
     slider.addEventListener('input', () => {
       const speed = SPEEDS[parseInt(slider.value)];
-      if (speed !== cachedSpeed) invalidateAudioCache('speed-changed');
+      const changed = speed !== cachedSpeed;
+      if (changed) invalidateAudioCache('speed-changed');
       cachedSpeed = speed;
       speedLbl.textContent = formatSpeedLabel(speed);
+      // I2(b): invalidation cancelled any queued foreground load; if we were
+      // mid-load, re-issue immediately with the new speed so the cancelled
+      // request is replaced rather than left stalling in 'loading'.
+      if (changed && pbState === 'loading') playSentence(pbIndex);
       chrome.storage.local.set({ defaultSpeed: speed.toString() }, () => {
         const storageError = chrome.runtime.lastError?.message || null;
         if (storageError) logDebug('speed-save-failed', { error: storageError });
@@ -730,8 +748,12 @@
 
     // Voice select
     menuPanelEl.querySelector('.hltr-voice-select').addEventListener('change', (e) => {
-      if (e.target.value !== cachedVoice) invalidateAudioCache('voice-changed');
+      const changed = e.target.value !== cachedVoice;
+      if (changed) invalidateAudioCache('voice-changed');
       cachedVoice = e.target.value;
+      // I2(b): same as the speed slider — replace a cancelled queued load with
+      // the new voice instead of stalling in 'loading'.
+      if (changed && pbState === 'loading') playSentence(pbIndex);
       chrome.storage.local.set({ defaultVoice: e.target.value }, () => {
         const storageError = chrome.runtime.lastError?.message || null;
         if (storageError) logDebug('voice-save-failed', { error: storageError });
@@ -1009,7 +1031,7 @@
 
     const text = pbSentences[idx].text;
     const startedAt = performance.now();
-    const clientRequestId = ++ttsClientSeq;
+    const clientRequestId = `${ttsSessionNonce}:${++ttsClientSeq}`;
     inflightTtsIds.add(clientRequestId);
     logDebug('prefetch-start', { idx, voice, speed, textLength: text.length });
 
@@ -1192,6 +1214,7 @@
     const cachedUrl = getCachedAudio(idx, voice, speed);
     if (cachedUrl) {
       logDebug('tts-cache-hit', { idx, voice, speed });
+      cancelledRetryCount = 0; // a real (cached) Kokoro response is playing
       playAudioDataUrl(cachedUrl, requestId, speed, text);
       maybePrefetchAhead(idx, voice, speed);
       return;
@@ -1227,8 +1250,6 @@
         idx,
         elapsedMs: Math.round(performance.now() - startedAt),
       });
-      // A4: this engine round-trip failed — count it toward the session policy.
-      sessionFallbackCount++;
       // A2: invalidate the in-flight request NOW. The original tts-request's
       // sendMessage callback may still fire late with real Kokoro audio; bumping
       // here means the response handler's staleness guard discards it instead of
@@ -1244,7 +1265,13 @@
         void chrome.runtime.lastError;
         // User moved on during the status round-trip — abandon this fallback.
         if (fallbackId !== pbRequestId) return;
-        const msg = (status?.status === 'downloading' &&
+        const isDownloading = status?.status === 'downloading';
+        // I3: a transient model download is fast and self-resolving — falling
+        // back this sentence is fine, but don't latch the whole session onto the
+        // system voice for it (that would stop probing and mask recovery). Only
+        // count genuine slowness (engine already ready) toward the policy.
+        if (!isDownloading) sessionFallbackCount++;
+        const msg = (isDownloading &&
                      typeof status.progress === 'number' && status.progress > 0)
           ? `Downloading voice model (${status.progress}%) — reading with system voice`
           : 'Voice engine is taking longer than usual — reading with system voice';
@@ -1253,7 +1280,7 @@
       });
     }, TTS_TIMEOUT_MS);
 
-    const clientRequestId = ++ttsClientSeq;
+    const clientRequestId = `${ttsSessionNonce}:${++ttsClientSeq}`;
     inflightTtsIds.add(clientRequestId);
     chrome.runtime.sendMessage(
       { type: 'tts-request', text, voice, speed, clientRequestId },
@@ -1275,11 +1302,21 @@
         });
 
         if (chrome.runtime.lastError || !response || !response.ok) {
-          // A7: a cancelled request is an expected, quiet outcome (forward-compat
-          // with Wave B request cancellation) — no toast, no fallback, and it
-          // does NOT count against the session fallback policy.
+          // I2(a): reaching the 'cancelled' branch here means the staleness
+          // guard above already passed (requestId === pbRequestId), so a cancel
+          // caught the CURRENT, still-wanted request — the known path is a
+          // voice/speed change cancelling a queued foreground load. Re-issue
+          // with a fresh id rather than stalling in 'loading'; cap the retries
+          // so a genuinely stuck engine still falls back to the system voice.
           if (response?.error === 'cancelled') {
-            logDebug('tts-response-cancelled', { idx });
+            logDebug('tts-cancelled-current', { idx, retries: cancelledRetryCount });
+            if (cancelledRetryCount < 2) {
+              cancelledRetryCount++;
+              playSentence(idx);
+            } else {
+              showPlayerWarning('Voice engine busy — using system voice');
+              fallbackSpeechSynthesis(text, speed, ++pbRequestId);
+            }
             return;
           }
           console.error('[Highlighter TTS] Response failure:', {
@@ -1295,7 +1332,10 @@
           });
           console.warn(LOG_PREFIX, errMsg, '— falling back to speechSynthesis');
           // A4: engine round-trip failed — count it toward the session policy.
-          sessionFallbackCount++;
+          // I3: except 'model-loading' — that's fast and self-resolving, so we
+          // fall back for THIS sentence but don't latch the whole session onto
+          // the system voice (which would stop probing and hide recovery).
+          if (response?.error !== 'model-loading') sessionFallbackCount++;
           showPlayerWarning(errMsg, details);
           fallbackSpeechSynthesis(text, speed, requestId);
           return;
@@ -1311,6 +1351,7 @@
         // the session fallback policy and re-arm its one-shot toast.
         sessionFallbackCount = 0;
         sessionFallbackToastShown = false;
+        cancelledRetryCount = 0; // engine delivered — reset the I2 retry budget
 
         // Stash for skip-back / replay; no extra round-trip if we revisit.
         setCachedAudio(idx, voice, speed, response.audioDataUrl);
