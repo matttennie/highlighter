@@ -86,7 +86,7 @@
   // Per-sentence cache so skip-back / pre-fetched-N+1 don't burn extra synth calls.
   // Insertion-ordered Map gives us cheap LRU when we delete the oldest entry on overflow.
   const audioCache = new Map();      // sentenceIdx → { audioDataUrl, voice, speed }
-  const pendingPrefetch = new Map(); // sentenceIdx → { token: { cancelled } }
+  const pendingPrefetch = new Map(); // sentenceIdx → { token: { cancelled }, voice, speed, waiter }
   let prefetchGeneration = 0;        // bumped on voice/speed change to drop stale results
   let skipDebounceTimer = 0;
   let pendingSkipTarget = -1;
@@ -985,6 +985,16 @@
 
   function cancelAllPrefetches() {
     prefetchGeneration++; // any in-flight prefetch responses will check this and discard
+    // Release any playSentence that joined a prefetch we're dropping: mark the
+    // token cancelled (so the waiter treats this as a teardown, not a retry —
+    // the caller owns the next request) and resolve the waiter with null so it
+    // clears its timeout and never hangs in 'loading'.
+    for (const entry of pendingPrefetch.values()) {
+      entry.token.cancelled = true;
+      const waiter = entry.waiter;
+      entry.waiter = null;
+      if (waiter) waiter(null);
+    }
     pendingPrefetch.clear();
   }
 
@@ -1027,7 +1037,12 @@
 
     const myGen = prefetchGeneration;
     const token = { cancelled: false };
-    pendingPrefetch.set(idx, token);
+    // Entry records voice/speed so a cache-missed playSentence can JOIN this
+    // in-flight synth (identical params) instead of firing a duplicate
+    // tts-request the serial offscreen queue would only run after we finish.
+    // `waiter` is the single joined callback (null until a playSentence joins).
+    const entry = { token, voice, speed, waiter: null };
+    pendingPrefetch.set(idx, entry);
 
     const text = pbSentences[idx].text;
     const startedAt = performance.now();
@@ -1040,9 +1055,15 @@
       (response) => {
         inflightTtsIds.delete(clientRequestId);
         pendingPrefetch.delete(idx);
+        // Hand our result to a playSentence that joined this prefetch, if any.
+        // Resolve exactly once: null on any failure/cancel/stale, the audio url
+        // on success. A superseded joiner is filtered by its own requestId guard.
+        const waiter = entry.waiter;
+        entry.waiter = null;
         const elapsedMs = Math.round(performance.now() - startedAt);
         if (token.cancelled || myGen !== prefetchGeneration) {
           logDebug('prefetch-discarded', { idx, elapsedMs, reason: token.cancelled ? 'cancelled' : 'stale-gen' });
+          if (waiter) waiter(null);
           return;
         }
         if (chrome.runtime.lastError || !response?.ok || !response.audioDataUrl) {
@@ -1050,6 +1071,7 @@
           // Wave B) — don't log it as a failure, don't touch the session policy.
           if (response?.error === 'cancelled') {
             logDebug('prefetch-cancelled', { idx, elapsedMs });
+            if (waiter) waiter(null);
             return;
           }
           logDebug('prefetch-failed', {
@@ -1058,10 +1080,12 @@
             error: response?.error || chrome.runtime.lastError?.message || 'no-response',
             status: response?.status || null,
           });
+          if (waiter) waiter(null);
           return;
         }
         setCachedAudio(idx, voice, speed, response.audioDataUrl);
         logDebug('prefetch-cached', { idx, elapsedMs, audioBase64Length: response.audioDataUrl.length });
+        if (waiter) waiter(response.audioDataUrl);
       }
     );
   }
@@ -1279,6 +1303,46 @@
         fallbackSpeechSynthesis(text, speed, fallbackId);
       });
     }, TTS_TIMEOUT_MS);
+
+    // ── Latency fix: JOIN an in-flight prefetch instead of double-synthesizing ──
+    // If a prefetch for this exact sentence is already synthesizing (measured:
+    // sentence N ends while prefetch(N+1) is still in flight), wait on it rather
+    // than firing a second identical tts-request the serial offscreen queue would
+    // only process AFTER the prefetch finishes — the bug behind the 13-27s
+    // inter-sentence gaps. Only join when voice+speed match; otherwise the
+    // prefetch's result is cache-key-mismatched and useless to us.
+    const pending = pendingPrefetch.get(idx);
+    if (pending && pending.voice === voice && pending.speed === speed) {
+      logDebug('tts-join-prefetch', { idx, voice, speed });
+      // Overwriting any prior waiter is safe: it belonged to a superseded
+      // playSentence whose requestId guard will discard its resolution.
+      pending.waiter = (audioDataUrl) => {
+        // Whichever fires first — this resolution or the shared timeout — wins;
+        // clear the timeout so a delivered join doesn't later trip the fallback.
+        clearTimeout(responseTimeout);
+        // Superseded (skip / new stroke / menu change bumped pbRequestId) — the
+        // newer request owns playback; discard exactly like the sendMessage guard.
+        if (requestId !== pbRequestId) return;
+        if (audioDataUrl) {
+          // The prefetch delivered real Kokoro audio — engine healthy, and it
+          // already ran setCachedAudio, so just play and prefetch ahead.
+          sessionFallbackCount = 0;
+          sessionFallbackToastShown = false;
+          cancelledRetryCount = 0;
+          playAudioDataUrl(audioDataUrl, requestId, speed, text);
+          maybePrefetchAhead(idx, voice, speed);
+        } else if (pending.token.cancelled) {
+          // Teardown nulled the prefetch (a voice/speed change re-issues on its
+          // own; stop/hide already went idle) — the caller owns the next
+          // request; firing one here would resurrect the duplicate-synth bug.
+        } else {
+          // The prefetch's OWN request failed — retry once through the front
+          // door. The failed entry is already deleted, so this won't re-join.
+          playSentence(idx);
+        }
+      };
+      return;
+    }
 
     const clientRequestId = `${ttsSessionNonce}:${++ttsClientSeq}`;
     inflightTtsIds.add(clientRequestId);

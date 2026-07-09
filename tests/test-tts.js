@@ -546,3 +546,79 @@ describe('content.js tts-cancel protocol contracts', () => {
     );
   });
 });
+
+// ── Latency: playSentence joins an in-flight prefetch (mirrors content.js) ──
+// Pins the double-synthesis fix structurally: when sentence N ends while
+// prefetch(N+1) is still synthesizing, a cache-missed playSentence must WAIT on
+// that in-flight prefetch instead of firing a duplicate tts-request the serial
+// offscreen queue would only process after the prefetch finishes (measured:
+// 13-27s inter-sentence gaps from synthesizing the identical audio twice).
+describe('content.js join-in-flight-prefetch contracts', () => {
+  const contentJs = fs.readFileSync(path.join(rootDir, 'content', 'content.js'), 'utf8');
+
+  // Scope assertions to playSentence's body so a match elsewhere can't false-pass.
+  const playSentenceBody = contentJs.match(
+    /function playSentence\(idx\)\s*\{([\s\S]*?)\n {2}function pausePlayback\(\)/,
+  );
+
+  it('playSentence consults pendingPrefetch before sending a tts-request', () => {
+    assert.ok(playSentenceBody, 'playSentence body not found');
+    const body = playSentenceBody[1];
+    const joinAt = body.indexOf('pendingPrefetch.get(idx)');
+    const sendAt = body.indexOf('inflightTtsIds.add(clientRequestId)');
+    assert.ok(joinAt !== -1, 'playSentence must consult pendingPrefetch.get(idx)');
+    assert.ok(sendAt !== -1, 'playSentence must still have a direct-send path');
+    assert.ok(joinAt < sendAt, 'the pendingPrefetch join check must precede the direct tts-request send');
+  });
+
+  it('joins only when the prefetch voice AND speed match the current request', () => {
+    assert.ok(playSentenceBody, 'playSentence body not found');
+    assert.match(
+      playSentenceBody[1],
+      /pending\.voice === voice && pending\.speed === speed/,
+      'playSentence must compare the prefetch entry voice/speed against its own before joining',
+    );
+  });
+
+  it('registers a single waiter that clears the shared timeout and honours the staleness guard', () => {
+    assert.ok(playSentenceBody, 'playSentence body not found');
+    const body = playSentenceBody[1];
+    assert.match(body, /pending\.waiter = \(audioDataUrl\) =>/, 'playSentence must register a waiter on the pending prefetch');
+    assert.match(
+      body,
+      /clearTimeout\(responseTimeout\)[\s\S]*?if \(requestId !== pbRequestId\) return/,
+      'the waiter must clear the shared responseTimeout and discard a superseded resolution by requestId',
+    );
+  });
+
+  it('prefetch entries carry voice and speed (and a waiter slot) for the join match', () => {
+    assert.match(
+      contentJs,
+      /const entry = \{ token, voice, speed, waiter: null \}/,
+      'prefetchSentence must record voice/speed and a waiter slot on the pendingPrefetch entry',
+    );
+    assert.match(contentJs, /pendingPrefetch\.set\(idx, entry\)/);
+  });
+
+  it('prefetch resolves its waiter with the audio url on success and null on every failure path', () => {
+    assert.match(
+      contentJs,
+      /if \(waiter\) waiter\(response\.audioDataUrl\)/,
+      'a successful prefetch must resolve the waiter with the synthesized audio url',
+    );
+    const nullResolves = contentJs.match(/if \(waiter\) waiter\(null\)/g) || [];
+    // prefetch callback: discarded/stale + cancelled + failed, plus cancelAllPrefetches teardown.
+    assert.ok(
+      nullResolves.length >= 3,
+      'the discarded/stale, cancelled, and failed prefetch paths must each resolve the waiter with null',
+    );
+  });
+
+  it('cancelAllPrefetches resolves outstanding waiters so a joined playSentence never hangs', () => {
+    assert.match(
+      contentJs,
+      /function cancelAllPrefetches\(\)\s*\{[\s\S]*?entry\.token\.cancelled = true[\s\S]*?if \(waiter\) waiter\(null\)[\s\S]*?pendingPrefetch\.clear\(\)/,
+      'cancelAllPrefetches must mark tokens cancelled and resolve outstanding waiters with null before clearing the map',
+    );
+  });
+});
