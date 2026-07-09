@@ -25,9 +25,11 @@
   const PREFETCH_LOOKAHEAD = 1;     // sentences after the currently-playing one
   const SKIP_DEBOUNCE_MS = 250;     // collapse rapid skip taps into one synth call
   const AUDIO_CACHE_LIMIT = 12;     // LRU bound on cached sentence audio
-  // Kokoro truncates synthesis around 512 phoneme tokens (~450 chars);
-  // longer sentences are split at clause boundaries so nothing is lost.
-  const SENTENCE_CHUNK_LIMIT = 400;
+  // Kokoro truncates synthesis around 512 phoneme tokens (~450 chars); we cap
+  // well below that so worst-case per-request synth stays roughly 10-14s on slow
+  // CPUs. Longer sentences are split at clause boundaries so nothing is lost;
+  // the chunks share the original sentence's Range, so highlighting is unaffected.
+  const SENTENCE_CHUNK_LIMIT = 160;
 
   // ── State ──────────────────────────────────────────────────────────
   let highlightMode = false;
@@ -52,6 +54,14 @@
   let pbRequestId   = 0;      // monotonic counter to discard stale TTS responses
   let cachedVoice   = DEFAULT_VOICE_ID; // FIX 8: use constant
   let cachedSpeed   = 1.2;
+
+  // Session-level fallback policy (A4): after two engine failures (timeout or
+  // error) in one reading session, stop hitting the engine and read the rest
+  // with the system voice. Reset on a new stroke and on a successful Kokoro
+  // response. sessionFallbackToastShown makes the "using system voice" notice
+  // fire at most once per session.
+  let sessionFallbackCount = 0;
+  let sessionFallbackToastShown = false;
 
   // ── Audio cache + prefetch ────────────────────────────────────────
   // Per-sentence cache so skip-back / pre-fetched-N+1 don't burn extra synth calls.
@@ -318,6 +328,11 @@
   }
 
   function resolveAndSelect(startPt, endPt) {
+    stopPlayback(); // A1: a new stroke retires the previous reading session —
+    // bump pbRequestId so late/in-flight TTS responses from the old highlight are
+    // discarded (they can't poison the freshly-cleared cache via a stale closure
+    // idx, and can't play old text over the new selection); also release the
+    // audio element and cancel any system-voice speech that was mid-utterance.
     const topPt = startPt.y <= endPt.y ? startPt : endPt;
     const botPt = startPt.y <= endPt.y ? endPt   : startPt;
 
@@ -355,6 +370,10 @@
       // New stroke = entirely different sentence array; old cache is meaningless.
       cancelSkipDebounce();
       invalidateAudioCache('new-stroke');
+      // A4: fresh session — clear the fallback policy so the engine gets a clean
+      // chance on this highlight even if the previous one gave up on it.
+      sessionFallbackCount = 0;
+      sessionFallbackToastShown = false;
 
       showPlayer();
     } catch (e) {
@@ -947,6 +966,8 @@
 
   function prefetchSentence(idx, voice, speed) {
     if (idx < 0 || idx >= pbSentences.length) return;
+    // A4: policy engaged — don't queue engine work the session won't use.
+    if (sessionFallbackCount >= 2) return;
     if (audioCache.has(idx)) return;
     if (pendingPrefetch.has(idx)) return;
     if (!pbSentences[idx] || !pbSentences[idx].text) return;
@@ -969,6 +990,12 @@
           return;
         }
         if (chrome.runtime.lastError || !response?.ok || !response.audioDataUrl) {
+          // A7: a cancelled request is expected and quiet (forward-compat with
+          // Wave B) — don't log it as a failure, don't touch the session policy.
+          if (response?.error === 'cancelled') {
+            logDebug('prefetch-cancelled', { idx, elapsedMs });
+            return;
+          }
           logDebug('prefetch-failed', {
             idx,
             elapsedMs,
@@ -1000,10 +1027,44 @@
   }
 
   // ── Audio playback ────────────────────────────────────────────────
+  // A6: while loading, poll the engine once a second; when it's downloading the
+  // voice model, surface the percentage on the play button's tooltip (title
+  // only — no new DOM). The poller lives exactly as long as the 'loading' state.
+  let loadingStatusPoller = 0;
+
+  function startLoadingStatusPoll() {
+    if (loadingStatusPoller) return; // already polling
+    loadingStatusPoller = setInterval(() => {
+      if (pbState !== 'loading') { stopLoadingStatusPoll(); return; }
+      chrome.runtime.sendMessage({ type: 'engine-status-request' }, (status) => {
+        void chrome.runtime.lastError;
+        if (pbState !== 'loading' || !playerEl) return;
+        const playBtn = playerEl.querySelector('.hltr-play-pause');
+        if (!playBtn) return;
+        if (status?.status === 'downloading' && typeof status.progress === 'number') {
+          playBtn.title = `Downloading voice model — ${status.progress}%`;
+        }
+      });
+    }, 1000);
+  }
+
+  function stopLoadingStatusPoll() {
+    if (loadingStatusPoller) {
+      clearInterval(loadingStatusPoller);
+      loadingStatusPoller = 0;
+    }
+  }
+
   function setPlaybackState(state) {
     const prevState = pbState;
     pbState = state;
     logDebug('playback-state', { from: prevState, to: state });
+
+    // A6: run the download-progress poller only while loading; every other state
+    // (including the idle set by stopPlayback/hidePlayer) tears it down.
+    if (state === 'loading') startLoadingStatusPoll();
+    else stopLoadingStatusPoll();
+
     if (!playerEl) return;
 
     const playIcon  = playerEl.querySelector('.hltr-icon-play');
@@ -1088,12 +1149,27 @@
     const speed = currentSpeedForPlayback();
     const text = pbSentences[idx].text;
 
-    // Cache hit → skip the network roundtrip entirely.
+    // Cache hit → skip the network roundtrip entirely. Cached audio is real
+    // Kokoro output that was already synthesized, so we play it even when the
+    // session fallback policy is engaged (it's free and correct).
     const cachedUrl = getCachedAudio(idx, voice, speed);
     if (cachedUrl) {
       logDebug('tts-cache-hit', { idx, voice, speed });
       playAudioDataUrl(cachedUrl, requestId, speed, text);
       maybePrefetchAhead(idx, voice, speed);
+      return;
+    }
+
+    // A4: session fallback policy — after two engine failures this session, skip
+    // the round-trip entirely and read with the system voice. requestId is
+    // already the fresh, current pbRequestId, so fallback's own guard passes.
+    if (sessionFallbackCount >= 2) {
+      if (!sessionFallbackToastShown) {
+        sessionFallbackToastShown = true;
+        showPlayerWarning('Using system voice for the rest of this reading');
+      }
+      logDebug('session-fallback-engaged', { idx, sessionFallbackCount });
+      fallbackSpeechSynthesis(text, speed, requestId);
       return;
     }
 
@@ -1107,13 +1183,36 @@
     // FIX 7: Set a timeout so we don't hang in 'loading' forever if the
     // background worker dies or the network request stalls.
     const responseTimeout = setTimeout(() => {
+      // Staleness guard: if the user already skipped/re-stroked, this timeout
+      // belongs to an abandoned request — do nothing.
       if (requestId !== pbRequestId) return;
       logDebug('tts-request-timeout', {
         idx,
         elapsedMs: Math.round(performance.now() - startedAt),
       });
-      showPlayerWarning('Request timed out');
-      fallbackSpeechSynthesis(text, speed, requestId);
+      // A4: this engine round-trip failed — count it toward the session policy.
+      sessionFallbackCount++;
+      // A2: invalidate the in-flight request NOW. The original tts-request's
+      // sendMessage callback may still fire late with real Kokoro audio; bumping
+      // here means the response handler's staleness guard discards it instead of
+      // playing it over the system-voice fallback. The late response is dropped
+      // entirely — deliberately NOT cache-warmed, because its stale closure `idx`
+      // indexes the OLD pbSentences and would poison the cache after a new stroke.
+      pbRequestId++;
+      const fallbackId = pbRequestId;
+      // A3: honest toast — ask the engine why it's slow (~100ms round-trip is
+      // fine), then read with the system voice under the freshly-bumped id.
+      chrome.runtime.sendMessage({ type: 'engine-status-request' }, (status) => {
+        void chrome.runtime.lastError;
+        // User moved on during the status round-trip — abandon this fallback.
+        if (fallbackId !== pbRequestId) return;
+        const msg = (status?.status === 'downloading' &&
+                     typeof status.progress === 'number' && status.progress > 0)
+          ? `Downloading voice model (${status.progress}%) — reading with system voice`
+          : 'Voice engine is taking longer than usual — reading with system voice';
+        showPlayerWarning(msg);
+        fallbackSpeechSynthesis(text, speed, fallbackId);
+      });
     }, TTS_TIMEOUT_MS);
 
     chrome.runtime.sendMessage(
@@ -1135,6 +1234,13 @@
         });
 
         if (chrome.runtime.lastError || !response || !response.ok) {
+          // A7: a cancelled request is an expected, quiet outcome (forward-compat
+          // with Wave B request cancellation) — no toast, no fallback, and it
+          // does NOT count against the session fallback policy.
+          if (response?.error === 'cancelled') {
+            logDebug('tts-response-cancelled', { idx });
+            return;
+          }
           console.error('[Highlighter TTS] Response failure:', {
             runtimeError: chrome.runtime.lastError?.message || null,
             response,
@@ -1147,6 +1253,8 @@
             voice, speed, requestId, runtimeError,
           });
           console.warn(LOG_PREFIX, errMsg, '— falling back to speechSynthesis');
+          // A4: engine round-trip failed — count it toward the session policy.
+          sessionFallbackCount++;
           showPlayerWarning(errMsg, details);
           fallbackSpeechSynthesis(text, speed, requestId);
           return;
@@ -1157,6 +1265,11 @@
           showPlayerError('Empty audio response', buildErrorDetails(response, { voice, speed, requestId }));
           return;
         }
+
+        // A4: a fresh Kokoro response succeeded — the engine is healthy, so clear
+        // the session fallback policy and re-arm its one-shot toast.
+        sessionFallbackCount = 0;
+        sessionFallbackToastShown = false;
 
         // Stash for skip-back / replay; no extra round-trip if we revisit.
         setCachedAudio(idx, voice, speed, response.audioDataUrl);
@@ -1397,6 +1510,7 @@
         : 'Synthesis failed — using system voice';
       case 'timeout':           return 'Request timed out — try again';
       case 'no-response':       return 'Voice engine did not respond — using system voice';
+      case 'cancelled':         return 'Cancelled';
       default:                  return response.error || 'Unknown error';
     }
   }

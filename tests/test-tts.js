@@ -28,6 +28,7 @@ function getErrorMessage(response) {
       : 'Synthesis failed — using system voice';
     case 'timeout':           return 'Request timed out — try again';
     case 'no-response':       return 'Voice engine did not respond — using system voice';
+    case 'cancelled':         return 'Cancelled';
     default:                  return response.error || 'Unknown error';
   }
 }
@@ -67,6 +68,10 @@ describe('getErrorMessage', () => {
 
   it('maps no-response', () => {
     assert.match(getErrorMessage({ error: 'no-response' }), /did not respond/i);
+  });
+
+  it('maps cancelled quietly (Wave B forward-compat)', () => {
+    assert.equal(getErrorMessage({ error: 'cancelled' }), 'Cancelled');
   });
 
   it('maps model-loading with progress', () => {
@@ -388,6 +393,66 @@ describe('splitLongSentenceText', () => {
   it('adds a source-contract check that content.js applies chunking at the assignment site', () => {
     const contentJs = fs.readFileSync(path.join(rootDir, 'content', 'content.js'), 'utf8');
     assert.match(contentJs, /pbSentences = selected\.flatMap\(splitLongSentence\)/);
-    assert.match(contentJs, /SENTENCE_CHUNK_LIMIT = 400/);
+    assert.match(contentJs, /SENTENCE_CHUNK_LIMIT = 160/);
+  });
+});
+
+// ── Race-condition & session-policy source contracts (mirrors content.js) ──
+// These pin the concurrency fixes structurally so a refactor can't silently
+// reintroduce the timeout / new-stroke playback races or the fallback policy.
+describe('content.js race-condition & policy contracts', () => {
+  const contentJs = fs.readFileSync(path.join(rootDir, 'content', 'content.js'), 'utf8');
+
+  it('retires the old session: stopPlayback() is the first statement of resolveAndSelect', () => {
+    assert.match(
+      contentJs,
+      /function resolveAndSelect\(startPt, endPt\)\s*\{\s*stopPlayback\(\);/,
+      'resolveAndSelect must call stopPlayback() before anything else so a new stroke bumps pbRequestId and cancels the old session',
+    );
+  });
+
+  // Extract the responseTimeout handler body once so the following assertions
+  // are scoped to it (a bare [\s\S]*? would happily reach pbRequestId++ in a
+  // different function far below and false-pass).
+  const timeoutHandler = contentJs.match(
+    /const responseTimeout = setTimeout\(\(\) => \{([\s\S]*?)\}, TTS_TIMEOUT_MS\);/,
+  );
+
+  it('timeout invalidates the in-flight request: pbRequestId++ inside the responseTimeout handler', () => {
+    assert.ok(timeoutHandler, 'responseTimeout handler not found');
+    assert.match(
+      timeoutHandler[1],
+      /pbRequestId\+\+;/,
+      'the responseTimeout handler must bump pbRequestId so a late Kokoro response is discarded by the staleness guard',
+    );
+  });
+
+  it('honest timeout toast asks the engine for status', () => {
+    assert.ok(timeoutHandler, 'responseTimeout handler not found');
+    assert.match(
+      timeoutHandler[1],
+      /engine-status-request/,
+      'the responseTimeout handler must query engine-status-request to phrase the fallback toast honestly',
+    );
+  });
+
+  it('session fallback policy engages after two engine failures', () => {
+    assert.match(contentJs, /sessionFallbackCount >= 2/);
+  });
+
+  it('prefetch respects the session fallback policy', () => {
+    assert.match(
+      contentJs,
+      /function prefetchSentence\(idx, voice, speed\)\s*\{[\s\S]*?sessionFallbackCount >= 2[\s\S]*?function maybePrefetchAhead/,
+      'prefetchSentence must skip queuing engine work once the fallback policy is engaged',
+    );
+  });
+
+  it('maps the cancelled error code in content.js getErrorMessage', () => {
+    assert.match(contentJs, /case 'cancelled':/);
+  });
+
+  it('polls engine status while loading for the download-progress tooltip', () => {
+    assert.match(contentJs, /Downloading voice model — \$\{status\.progress\}%/);
   });
 });
