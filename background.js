@@ -162,6 +162,9 @@ function injectContentScript(tabId, callback, url = '') {
 }
 
 function sendToggle(tabId, url = '', retrying = false, done = () => {}) {
+  // The user is engaging — start warming the voice engine now so the first
+  // sentence doesn't wait for model load.
+  void ensureOffscreenDocument().catch(() => {});
   if (!Number.isInteger(tabId)) {
     done({ ok: false, error: 'tab-not-found' });
     return;

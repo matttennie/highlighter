@@ -61,6 +61,10 @@ describe('offscreen routing', () => {
     assert.match(backgroundJs, /OFFSCREEN_SEND_RETRIES = 5/);
     assert.match(backgroundJs, /offscreen-send-retry/);
   });
+
+  it('pre-warms the engine when the user toggles highlight mode', () => {
+    assert.match(backgroundJs, /function sendToggle\([\s\S]{0,200}?void ensureOffscreenDocument\(\)/);
+  });
 });
 
 describe('normalizeSpeed', () => {

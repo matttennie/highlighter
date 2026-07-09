@@ -9,6 +9,9 @@ const MODEL_ID = 'onnx-community/Kokoro-82M-v1.0-ONNX';
 const DEFAULT_VOICE_ID = 'bf_emma';
 const LOG_PREFIX = '[Highlighter Offscreen]';
 const BASE64_CHUNK_SIZE = 8192;
+const WARMUP_TEXT = 'Warming up.';
+const IDLE_COOLDOWN_MS = 15 * 60 * 1000;
+const IDLE_CHECK_INTERVAL_MS = 60 * 1000;
 
 // ONNX Runtime must load its WASM from inside the extension package —
 // MV3 forbids remote code. Model *weights* are data and may be fetched.
@@ -20,6 +23,8 @@ let initPromise = null;
 // Serializes synthesis: concurrent ONNX runs on one session degrade both.
 let synthQueue = Promise.resolve();
 let engineStatus = { status: 'idle', progress: 0, device: null, error: null };
+let lastActivityAt = Date.now();
+let activeSynths = 0;
 
 // Human labels for Kokoro's language codes (voice ids are prefixed, e.g.
 // af_* = American female, bm_* = British male).
@@ -35,19 +40,10 @@ const LANGUAGE_LABELS = {
   'zh': 'Chinese',
 };
 
-async function pickBackend() {
-  // navigator.gpu existing does not mean the adapter works — probe it so
-  // broken-GPU machines skip straight to WASM instead of downloading the
-  // large WebGPU model first. fp32 is the recommended WebGPU pairing — fp16
-  // produces audible precision artifacts with this model.
-  if (typeof navigator !== 'undefined' && navigator.gpu) {
-    try {
-      const adapter = await navigator.gpu.requestAdapter();
-      if (adapter) return { device: 'webgpu', dtype: 'fp32' };
-    } catch {
-      // fall through to WASM
-    }
-  }
+function pickBackend() {
+  // CPU/WASM only. WebGPU (both fp16 and fp32) produced audible artifacts
+  // on macOS Metal with this model — revisit when upstream kokoro-js/
+  // transformers.js WebGPU output is clean.
   return { device: 'wasm', dtype: 'q8' };
 }
 
@@ -66,17 +62,12 @@ function loadModel({ device, dtype }) {
 function ensureEngine() {
   if (initPromise) return initPromise;
   initPromise = (async () => {
-    const attempt = await pickBackend();
+    const attempt = pickBackend();
     engineStatus = { status: 'downloading', progress: 0, device: attempt.device, error: null };
-    try {
-      tts = await loadModel(attempt);
-    } catch (err) {
-      if (attempt.device !== 'webgpu') throw err;
-      // WebGPU init can fail on adapter/driver issues — retry on CPU.
-      console.warn(`${LOG_PREFIX} WebGPU load failed, retrying on WASM:`, err?.message || err);
-      engineStatus = { status: 'downloading', progress: 0, device: 'wasm', error: null };
-      tts = await loadModel({ device: 'wasm', dtype: 'q8' });
-    }
+    tts = await loadModel(attempt);
+    // Pay the one-time graph-compilation cost now, not during the first
+    // real sentence (same warmup trick as the local kokoro server).
+    await tts.generate(WARMUP_TEXT, { voice: DEFAULT_VOICE_ID, speed: 1.2 });
     engineStatus = { status: 'ready', progress: 100, device: engineStatus.device, error: null };
     console.log(`${LOG_PREFIX} model ready`, { device: engineStatus.device });
     return tts;
@@ -122,20 +113,28 @@ function notReadyResponse() {
 }
 
 async function handleTts(msg) {
+  lastActivityAt = Date.now();
   if (engineStatus.status !== 'ready') return notReadyResponse();
 
   const voice = resolveVoice(typeof msg.voice === 'string' ? msg.voice.trim() : '');
   const speed = clampSpeed(msg.speed);
   const run = synthQueue.then(async () => {
-    const audio = await tts.generate(msg.text, { voice, speed });
-    const wav = audio.toWav(); // 24 kHz mono PCM WAV as ArrayBuffer
-    return { ok: true, audioDataUrl: `data:audio/wav;base64,${arrayBufferToBase64(wav)}` };
+    activeSynths += 1;
+    try {
+      const audio = await tts.generate(msg.text, { voice, speed });
+      const wav = audio.toWav(); // 24 kHz mono PCM WAV as ArrayBuffer
+      lastActivityAt = Date.now();
+      return { ok: true, audioDataUrl: `data:audio/wav;base64,${arrayBufferToBase64(wav)}` };
+    } finally {
+      activeSynths -= 1;
+    }
   });
   synthQueue = run.then(() => {}, () => {}); // keep the queue alive after failures
   return run;
 }
 
 function handleVoices() {
+  lastActivityAt = Date.now();
   if (engineStatus.status !== 'ready') return notReadyResponse();
 
   const voices = Object.entries(tts.voices).map(([voiceId, v]) => ({
@@ -179,3 +178,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // Warm the model as soon as the document exists — the background only
 // creates this document when TTS is about to be used.
 void ensureEngine().catch(() => {});
+
+// Release the model after sustained idle. An idle resident model costs RAM,
+// not CPU — the cooldown exists to return memory, and the background
+// recreates this document (and re-warms) on the next request.
+setInterval(() => {
+  if (engineStatus.status !== 'ready') return;
+  if (activeSynths > 0) return;
+  if (Date.now() - lastActivityAt < IDLE_COOLDOWN_MS) return;
+  console.log(`${LOG_PREFIX} idle cooldown — closing offscreen document`);
+  window.close();
+}, IDLE_CHECK_INTERVAL_MS);

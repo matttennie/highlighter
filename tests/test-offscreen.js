@@ -27,10 +27,17 @@ describe('offscreen document', () => {
     assert.match(engineJs, /msg\.target !== 'offscreen'/);
   });
 
-  it('falls back from WebGPU to WASM q8', () => {
-    assert.match(engineJs, /device: 'webgpu', dtype: 'fp32'/);
+  it('synthesizes on CPU only — WebGPU is disabled for audio quality', () => {
     assert.match(engineJs, /device: 'wasm', dtype: 'q8'/);
-    assert.match(engineJs, /navigator\.gpu\.requestAdapter\(\)/);
+    assert.doesNotMatch(engineJs, /device: 'webgpu'/);
+    assert.doesNotMatch(engineJs, /requestAdapter/);
+  });
+
+  it('warms up the graph before reporting ready and cools down after idle', () => {
+    assert.match(engineJs, /WARMUP_TEXT = 'Warming up\.'/);
+    assert.match(engineJs, /IDLE_COOLDOWN_MS = 15 \* 60 \* 1000/);
+    assert.match(engineJs, /window\.close\(\)/);
+    assert.match(engineJs, /activeSynths > 0\) return;/);
   });
 
   it('produces WAV data URLs and uses the shared default voice', () => {
