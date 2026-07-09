@@ -28,14 +28,14 @@ describe('offscreen document', () => {
   });
 
   it('falls back from WebGPU to WASM q8', () => {
-    assert.match(engineJs, /device: 'webgpu', dtype: 'fp16'/);
+    assert.match(engineJs, /device: 'webgpu', dtype: 'fp32'/);
     assert.match(engineJs, /device: 'wasm', dtype: 'q8'/);
     assert.match(engineJs, /navigator\.gpu\.requestAdapter\(\)/);
   });
 
   it('produces WAV data URLs and uses the shared default voice', () => {
     assert.match(engineJs, /data:audio\/wav;base64,/);
-    assert.match(engineJs, /DEFAULT_VOICE_ID = 'af_heart'/);
+    assert.match(engineJs, /DEFAULT_VOICE_ID = 'bf_emma'/);
   });
 
   it('reports model-loading with progress while the model downloads', () => {

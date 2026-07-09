@@ -8,7 +8,7 @@ const copyDebugLogBtn = document.getElementById('copyDebugLog');
 const clearDebugLogBtn = document.getElementById('clearDebugLog');
 const testVoiceBtn = document.getElementById('testVoiceBtn');
 const debugPreview = document.getElementById('debugPreview');
-const DEFAULT_VOICE_ID = 'af_heart';
+const DEFAULT_VOICE_ID = 'bf_emma';
 const LOG_PREFIX = '[Highlighter Popup]';
 const SPEED_MIN = 0.5;
 const SPEED_MAX = 2.0;
@@ -76,7 +76,7 @@ chrome.storage.local.get(['defaultVoice', 'defaultSpeed', 'articleMode'], (data)
   });
 
   const effectiveVoice = data.defaultVoice || DEFAULT_VOICE_ID;
-  renderSpeed(snapSpeed(data.defaultSpeed ?? 1.0));
+  renderSpeed(snapSpeed(data.defaultSpeed ?? 1.2));
   if (data.articleMode !== undefined) articleToggle.checked = data.articleMode;
 
   ensureVoiceOption(effectiveVoice, 'Saved voice');

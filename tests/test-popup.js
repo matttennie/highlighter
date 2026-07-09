@@ -83,7 +83,7 @@ describe('default voice ID consistency', () => {
     for (const [name, src] of [['popup.js', popupJs], ['background.js', backgroundJs], ['content.js', contentJs]]) {
       const match = src.match(/DEFAULT_VOICE_ID\s*=\s*'([^']+)'/);
       assert.ok(match, `${name} should define DEFAULT_VOICE_ID`);
-      assert.equal(match[1], 'af_heart', `${name} DEFAULT_VOICE_ID`);
+      assert.equal(match[1], 'bf_emma', `${name} DEFAULT_VOICE_ID`);
     }
   });
 });

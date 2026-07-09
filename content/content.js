@@ -10,14 +10,14 @@
   window.__highlighterTtsContentLoaded = true;
 
   // ── Constants ──────────────────────────────────────────────────────
-  const DEFAULT_VOICE_ID = 'af_heart';
+  const DEFAULT_VOICE_ID = 'bf_emma';
   const CURSOR_SIZE      = 22;
   const LINE_TOLERANCE   = 14;  // for END line detection (confirmed working)
   // Kokoro's supported synthesis range. 16 detents in 0.1 increments.
   // Math.round avoids float-arithmetic drift (0.5 + 7*0.1 !== 1.2 in
   // IEEE 754) that would break SPEEDS.indexOf checks.
   const SPEEDS = Array.from({ length: 16 }, (_, i) => Math.round((0.5 + i * 0.1) * 100) / 100);
-  const SPEED_DEFAULT_INDEX = SPEEDS.indexOf(1.0); // 5
+  const SPEED_DEFAULT_INDEX = SPEEDS.indexOf(1.2); // 7
   const TTS_TIMEOUT_MS   = 35000; // FIX 7: response timeout
   const AUDIO_START_TIMEOUT_MS = 8000;
   const BASE64_CHUNK_SIZE = 8192;
@@ -51,7 +51,7 @@
   let pbState       = 'idle'; // 'idle' | 'loading' | 'playing' | 'paused' | 'error'
   let pbRequestId   = 0;      // monotonic counter to discard stale TTS responses
   let cachedVoice   = DEFAULT_VOICE_ID; // FIX 8: use constant
-  let cachedSpeed   = 1.0;
+  let cachedSpeed   = 1.2;
 
   // ── Audio cache + prefetch ────────────────────────────────────────
   // Per-sentence cache so skip-back / pre-fetched-N+1 don't burn extra synth calls.
@@ -630,7 +630,7 @@
         <label class="hltr-menu-label">Speed</label>
         <div class="hltr-speed-row">
           <input type="range" class="hltr-speed-slider" min="0" max="${SPEEDS.length - 1}" step="1" value="${SPEED_DEFAULT_INDEX}">
-          <span class="hltr-speed-label">1.0x</span>
+          <span class="hltr-speed-label">1.2x</span>
         </div>
       </div>
     `;

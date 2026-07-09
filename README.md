@@ -6,7 +6,7 @@
 
 All speech is generated on your device by the Kokoro-82M model — no API
 key, no cloud calls, no per-use cost. On first use the extension downloads
-the Kokoro voice model (~163 MB on GPU-accelerated Chrome, ~92 MB on the
+the Kokoro voice model (~326 MB on GPU-accelerated Chrome, ~92 MB on the
 CPU fallback path — one time, cached permanently); until it finishes,
 playback falls back to your system voice.
 
@@ -43,7 +43,7 @@ npm run build
 - Select this folder
 
 No API key or account is required. The first time you use the extension it
-downloads the Kokoro voice model (~163 MB on GPU-accelerated Chrome, ~92 MB
+downloads the Kokoro voice model (~326 MB on GPU-accelerated Chrome, ~92 MB
 on the CPU fallback path) and caches it permanently.
 
 ## Usage

@@ -6,7 +6,7 @@ import { KokoroTTS } from 'kokoro-js';
 import { env } from '@huggingface/transformers';
 
 const MODEL_ID = 'onnx-community/Kokoro-82M-v1.0-ONNX';
-const DEFAULT_VOICE_ID = 'af_heart';
+const DEFAULT_VOICE_ID = 'bf_emma';
 const LOG_PREFIX = '[Highlighter Offscreen]';
 const BASE64_CHUNK_SIZE = 8192;
 
@@ -38,12 +38,12 @@ const LANGUAGE_LABELS = {
 async function pickBackend() {
   // navigator.gpu existing does not mean the adapter works — probe it so
   // broken-GPU machines skip straight to WASM instead of downloading the
-  // large WebGPU model first. fp16 halves the download vs fp32 with no
-  // meaningful audio-quality loss for speech.
+  // large WebGPU model first. fp32 is the recommended WebGPU pairing — fp16
+  // produces audible precision artifacts with this model.
   if (typeof navigator !== 'undefined' && navigator.gpu) {
     try {
       const adapter = await navigator.gpu.requestAdapter();
-      if (adapter) return { device: 'webgpu', dtype: 'fp16' };
+      if (adapter) return { device: 'webgpu', dtype: 'fp32' };
     } catch {
       // fall through to WASM
     }

@@ -96,7 +96,7 @@ export async function launchExtension({ startedAt, profilePrefix = 'highlighter-
   await popupPage.goto(`chrome-extension://${extensionId}/popup/popup.html`);
   await popupPage.evaluate(async () => {
     await chrome.storage.local.set({
-      defaultVoice: 'af_heart',
+      defaultVoice: 'bf_emma',
       defaultSpeed: '1',
     });
   });

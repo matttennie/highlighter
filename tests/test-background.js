@@ -53,7 +53,7 @@ describe('offscreen routing', () => {
   });
 
   it('uses the Kokoro default voice', () => {
-    assert.match(backgroundJs, /DEFAULT_VOICE_ID = 'af_heart'/);
+    assert.match(backgroundJs, /DEFAULT_VOICE_ID = 'bf_emma'/);
   });
 
   it('retries offscreen sends while the bundle is still evaluating', () => {

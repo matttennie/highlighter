@@ -1,7 +1,7 @@
 'use strict';
 
 // ── Constants ───────────────────────────────────────────────────────
-const DEFAULT_VOICE_ID = 'af_heart';
+const DEFAULT_VOICE_ID = 'bf_emma';
 // Not an API limit anymore — bounds worst-case on-device synth latency
 // for a single request (the content script sends one sentence at a time).
 const MAX_TEXT_LENGTH = 2000;
