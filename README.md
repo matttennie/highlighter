@@ -5,12 +5,21 @@
 ## How it works
 
 All speech is generated on your device by the Kokoro-82M model — no API
-key, no cloud calls, no per-use cost. On first use the extension downloads
-the Kokoro voice model (~92 MB — one time, cached permanently); until it
-finishes, playback falls back to your system voice. Synthesis runs on-CPU
-for consistent audio quality. To save memory, the voice engine unloads
-itself after 15 minutes of inactivity and re-warms automatically the next
-time it's needed.
+key, no cloud calls, no per-use cost. The extension speaks through one of
+two backends, chosen automatically:
+
+1. **Native companion server (best):** if the optional local server (see
+   Setup below) is running, the extension routes synthesis to it over
+   `http://127.0.0.1:8880` for near-instant, gapless playback.
+2. **Built-in in-browser engine (default):** otherwise the extension runs
+   Kokoro itself via WASM. On first use it downloads the voice model
+   (~92 MB — one time, cached permanently); until that finishes, playback
+   falls back to your system voice. Synthesis runs on-CPU for consistent
+   audio quality, and the engine unloads itself after 15 minutes of
+   inactivity, re-warming automatically the next time it's needed.
+
+Either way, playback adds brief natural pauses between sentences and
+longer ones at paragraph breaks so speech doesn't sound rushed.
 
 ## Features
 
@@ -44,8 +53,25 @@ npm run build
 - Click `Load unpacked`
 - Select this folder
 
-No API key or account is required. The first time you use the extension it
-downloads the Kokoro voice model (~92 MB) and caches it permanently.
+No API key or account is required. The first time you use the extension
+without the native server running, it downloads the Kokoro voice model
+(~92 MB) and caches it permanently.
+
+### Native companion server (recommended)
+
+For near-instant, gapless playback, install the local Kokoro server:
+
+```bash
+bash server/install.sh
+```
+
+This installs a `launchd` agent (`com.highlighter.kokoro`) that serves
+Kokoro on `http://127.0.0.1:8880`, starts automatically at login, and
+unloads the model after 15 idle minutes to save memory (it reloads on
+the next request). It requires the Kokoro model files at
+`~/.cache/kokoro/`; `install.sh` prints download instructions if they're
+missing. Once installed, the extension detects and uses the server
+automatically — no configuration needed.
 
 ## Usage
 

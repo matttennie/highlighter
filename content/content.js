@@ -448,10 +448,10 @@
     const chunks = [];
     let rest = trimmed;
     while (rest.length > limit) {
-      const window = rest.slice(0, limit);
+      const chunkWindow = rest.slice(0, limit);
       let cut = -1;
-      for (const m of window.matchAll(/[,;:—]/g)) cut = m.index;
-      if (cut < 1) cut = window.lastIndexOf(' ');
+      for (const m of chunkWindow.matchAll(/[,;:—]/g)) cut = m.index;
+      if (cut < 1) cut = chunkWindow.lastIndexOf(' ');
       if (cut < 1) cut = limit - 1; // no boundary at all — hard split
       chunks.push(rest.slice(0, cut + 1).trim());
       rest = rest.slice(cut + 1).trim();
@@ -701,7 +701,7 @@
         if (voiceSelect) voiceSelect.value = data.defaultVoice;
       }
       if (data.defaultSpeed) {
-        // Snap any saved value (legacy or current) to the nearest 0.05 detent.
+        // Snap any saved value (legacy or current) to the nearest 0.1 detent.
         const saved = parseFloat(data.defaultSpeed);
         if (Number.isFinite(saved)) {
           const idx = nearestSpeedIndex(saved);
@@ -1702,12 +1702,6 @@
     }
   }
 
-  function normalizePlaybackRate(speed) {
-    const parsed = parseFloat(speed);
-    if (!Number.isFinite(parsed)) return 1.0;
-    return Math.max(0.5, Math.min(2.0, parsed));
-  }
-
   function nearestSpeedIndex(speed) {
     const clamped = Math.max(SPEEDS[0], Math.min(SPEEDS[SPEEDS.length - 1], speed));
     let bestIdx = SPEED_DEFAULT_INDEX;
@@ -1719,11 +1713,9 @@
     return bestIdx;
   }
 
-  // Show 1 decimal for round-tenth values (1.0x, 1.5x), 2 decimals for fine ones (1.05x).
+  // SPEEDS are all single-decimal steps (0.5x, 0.6x, ... 2.0x).
   function formatSpeedLabel(speed) {
-    const tenths = speed * 10;
-    const isTenth = Math.abs(tenths - Math.round(tenths)) < 1e-9;
-    return (isTenth ? speed.toFixed(1) : speed.toFixed(2)) + 'x';
+    return speed.toFixed(1) + 'x';
   }
 
   function ensureVoiceOption(selectEl, voiceId, label) {

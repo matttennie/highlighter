@@ -236,43 +236,6 @@ describe('Request ID staleness guard', () => {
   });
 });
 
-// ── Playback-rate normalization (from content.js/background.js) ──────────────
-
-function normalizePlaybackRate(speed) {
-  const parsed = parseFloat(speed);
-  if (!Number.isFinite(parsed)) return 1.0;
-  return Math.max(0.5, Math.min(2.0, parsed));
-}
-
-describe('normalizePlaybackRate', () => {
-  it('defaults invalid input to 1.0', () => {
-    assert.equal(normalizePlaybackRate('abc'), 1.0);
-    assert.equal(normalizePlaybackRate(undefined), 1.0);
-    assert.equal(normalizePlaybackRate(null), 1.0);
-    assert.equal(normalizePlaybackRate(NaN), 1.0);
-    assert.equal(normalizePlaybackRate(Infinity), 1.0);
-  });
-
-  it('clamps values below minimum to 0.5', () => {
-    assert.equal(normalizePlaybackRate(0.25), 0.5);
-    assert.equal(normalizePlaybackRate(0), 0.5);
-    assert.equal(normalizePlaybackRate(-1), 0.5);
-  });
-
-  it('preserves in-range values', () => {
-    assert.equal(normalizePlaybackRate('1.1'), 1.1);
-    assert.equal(normalizePlaybackRate(0.5), 0.5);
-    assert.equal(normalizePlaybackRate(1.5), 1.5);
-    assert.equal(normalizePlaybackRate(1), 1.0);
-  });
-
-  it('clamps values above maximum to 2.0', () => {
-    assert.equal(normalizePlaybackRate(3), 2.0);
-    assert.equal(normalizePlaybackRate(2.1), 2.0);
-    assert.equal(normalizePlaybackRate(100), 2.0);
-  });
-});
-
 // ── Base64 encoding (from background.js) ────────────────────────────
 
 function arrayBufferToBase64(buffer) {
@@ -345,10 +308,10 @@ function splitLongSentenceText(text, limit) {
   const chunks = [];
   let rest = trimmed;
   while (rest.length > limit) {
-    const window = rest.slice(0, limit);
+    const chunkWindow = rest.slice(0, limit);
     let cut = -1;
-    for (const m of window.matchAll(/[,;:—]/g)) cut = m.index;
-    if (cut < 1) cut = window.lastIndexOf(' ');
+    for (const m of chunkWindow.matchAll(/[,;:—]/g)) cut = m.index;
+    if (cut < 1) cut = chunkWindow.lastIndexOf(' ');
     if (cut < 1) cut = limit - 1; // no boundary at all — hard split
     chunks.push(rest.slice(0, cut + 1).trim());
     rest = rest.slice(cut + 1).trim();
