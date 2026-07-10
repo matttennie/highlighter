@@ -529,53 +529,42 @@
     return style.display !== 'none' && style.visibility !== 'hidden';
   }
 
+  // ICU sentence segmentation via the platform — keeps decimals (3.14),
+  // filenames (content.js), versions (v1.0.onnx) and abbreviations-before-
+  // lowercase (e.g. the docs) intact, where the old regex fractured them.
+  // ponytail: V8's ICU ships no suppression dictionary, so an abbreviation
+  // followed by a capital ("Dr. Smith", "U.S. Government") still splits.
+  // Returns [{ text, start, end }] with offsets into the input string;
+  // `text` is trimmed, offsets cover the raw (untrimmed) segment.
+  const sentenceSegmenter = new Intl.Segmenter('en', { granularity: 'sentence' });
+  function segmentSentences(text) {
+    const results = [];
+    for (const seg of sentenceSegmenter.segment(text)) {
+      // Drop pure-punctuation/whitespace segments (":)", stray marks) — TTS
+      // engines either error or pronounce them literally ("colon close-paren").
+      const trimmed = stripLeadingNoise(seg.segment.trim());
+      if (!hasReadableContent(trimmed)) continue;
+      results.push({ text: trimmed, start: seg.index, end: seg.index + seg.segment.length });
+    }
+    return results;
+  }
+
   function extractSentencesFromBlock(el) {
     const text = el.textContent;
     if (!text.trim()) return [];
 
-    const results    = [];
-    // `.` is a terminator EXCEPT when it sits between two digits — that keeps
-    // version numbers (3.1.56), decimals (3.14), IPs, and currency intact.
-    const sentenceRe = /[^!?…]*?(?:[!?…]+|\.(?!\d)|(?<!\d)\.)+["'”’]?\s*/g;
-    let match, consumed = 0;
-
-    while ((match = sentenceRe.exec(text)) !== null) {
-      const raw = match[0];
-      const trimmed = stripLeadingNoise(raw.trim());
-      if (!hasReadableContent(trimmed)) { consumed = match.index + raw.length; continue; }
-      const charStart = match.index;
-      const charEnd   = match.index + raw.length;
-      consumed = charEnd;
-
-      const range = charOffsetsToRange(el, charStart, charEnd);
+    const results = [];
+    for (const { text: sentText, start, end } of segmentSentences(text)) {
+      const range = charOffsetsToRange(el, start, end);
       if (!range) continue;
       const rects = range.getClientRects();
       if (!rects.length) continue;
-
       results.push({
-        text: trimmed,
+        text: sentText,
         range,
         startLineY: rects[0].top,
         endLineY:   rects[rects.length - 1].top,
       });
-    }
-
-    const tail = stripLeadingNoise(text.slice(consumed).trim());
-    // Skip pure-punctuation tails (e.g. ":)" left after a paragraph) — TTS
-    // engines either error or pronounce them literally ("colon close-paren").
-    if (hasReadableContent(tail)) {
-      const range = charOffsetsToRange(el, consumed, text.length);
-      if (range) {
-        const rects = range.getClientRects();
-        if (rects.length) {
-          results.push({
-            text: tail,
-            range,
-            startLineY: rects[0].top,
-            endLineY:   rects[rects.length - 1].top,
-          });
-        }
-      }
     }
 
     return results;
