@@ -20,9 +20,13 @@
   const AUDIO_START_TIMEOUT_MS = 8000;
   const BASE64_CHUNK_SIZE = 8192;
   const LOG_PREFIX       = '[Highlighter TTS]';
-  const PREFETCH_LOOKAHEAD = 1;     // sentences after the currently-playing one
+  const PREFETCH_LOOKAHEAD = 1;     // eager kick-ahead; topUpPrefetch does the continuous refill
   const SKIP_DEBOUNCE_MS = 250;     // collapse rapid skip taps into one synth call
-  const AUDIO_CACHE_LIMIT = 12;     // LRU bound on cached sentence audio
+  // A whole selection now caches (continuous work-ahead pre-synthesizes every
+  // remaining sentence), so the bound holds the largest reasonable reading.
+  // ~500KB per sentence WAV, worst case ~30MB in page memory — acceptable,
+  // bounded, and freed on stroke/navigation/close via invalidateAudioCache.
+  const AUDIO_CACHE_LIMIT = 64;     // LRU bound on cached sentence audio
   // Kokoro truncates synthesis around 512 phoneme tokens (~450 chars); we cap
   // well below that so worst-case per-request synth stays roughly 10-14s on slow
   // CPUs. Longer sentences are split at clause boundaries so nothing is lost;
@@ -388,7 +392,7 @@
       sel.addRange(range);
 
       // Store sentences for playback navigation
-      pbSentences = selected.flatMap(splitLongSentence);
+      pbSentences = splitLongAfterShort(selected).flatMap(splitLongSentence);
       pbIndex     = 0;
       // New stroke = entirely different sentence array; old cache is meaningless.
       cancelSkipDebounce();
@@ -467,6 +471,34 @@
     }
     return splitLongSentenceText(sentence.text, SENTENCE_CHUNK_LIMIT)
       .map((chunkText, chunkIndex) => ({ ...sentence, text: chunkText, continuation: chunkIndex > 0 }));
+  }
+
+  // Latency pre-pass (runs BEFORE splitLongSentence): when a SHORT sentence
+  // (<90 chars) is followed by a LONG one (>200 chars), split the long one at
+  // the first clause boundary (, ; or —) at/after its midpoint. The quick short
+  // sentence buys almost no synth time, so shortening the long follower's first
+  // chunk gets its audio started sooner. The second half is a continuation, so
+  // pauseBeforeNext inserts NO pause mid-sentence. No boundary past the midpoint
+  // → leave it alone (splitLongSentence still hard-chunks monster halves).
+  function splitLongAfterShort(sentences) {
+    const out = [];
+    for (let i = 0; i < sentences.length; i++) {
+      const s = sentences[i];
+      const prev = sentences[i - 1];
+      if (prev && typeof prev.text === 'string' && prev.text.length < 90 &&
+          s && typeof s.text === 'string' && s.text.length > 200) {
+        const half = Math.floor(s.text.length / 2);
+        const rel = s.text.slice(half).search(/[,;—]/);
+        if (rel !== -1) {
+          const cut = half + rel;
+          out.push({ ...s, text: s.text.slice(0, cut + 1).trim() });
+          out.push({ ...s, text: s.text.slice(cut + 1).trim(), continuation: true });
+          continue;
+        }
+      }
+      out.push(s);
+    }
+    return out;
   }
 
   // ── Sentence collection ────────────────────────────────────────────
@@ -1107,6 +1139,12 @@
         setCachedAudio(idx, voice, speed, response.audioDataUrl);
         logDebug('prefetch-cached', { idx, elapsedMs, audioBase64Length: response.audioDataUrl.length });
         if (waiter) waiter(response.audioDataUrl);
+        // Continuous refill — only reachable in the non-stale, non-cancelled
+        // success branch (the guard above returns otherwise), so a dead session
+        // can't re-prime the pipeline. Uses this prefetch's voice/speed, which
+        // still match the current session (a change would have bumped the
+        // generation and diverted us to the stale branch).
+        topUpPrefetch(voice, speed);
       }
     );
   }
@@ -1114,6 +1152,24 @@
   function maybePrefetchAhead(currentIdx, voice, speed) {
     for (let off = 1; off <= PREFETCH_LOOKAHEAD; off++) {
       prefetchSentence(currentIdx + off, voice, speed);
+    }
+  }
+
+  // Continuous work-ahead: after a prefetch lands, queue the next still-uncached
+  // sentence so the serial synth queue never idles until the whole remaining
+  // selection is cached. Bounded to 2 in-flight prefetches so a burst of skips
+  // doesn't flood the queue with soon-to-be-cancelled synth work; the completion
+  // of either in-flight prefetch triggers the next topUp. Scans from pbIndex+1
+  // (read live) so a skip re-anchors the pipeline automatically. Only ever called
+  // from prefetchSentence's non-stale success branch, so a superseded/dead
+  // session (bumped prefetchGeneration) never re-primes the pipeline. The
+  // session-fallback gate is inherited from prefetchSentence.
+  function topUpPrefetch(voice, speed) {
+    if (pendingPrefetch.size >= 2) return;
+    for (let idx = pbIndex + 1; idx < pbSentences.length; idx++) {
+      if (audioCache.has(idx) || pendingPrefetch.has(idx)) continue;
+      prefetchSentence(idx, voice, speed);
+      return;
     }
   }
 
@@ -1362,6 +1418,11 @@
           playSentence(idx);
         }
       };
+      // Eager kick-ahead: queue the next sentence the instant this request is
+      // committed, not only when playback starts, so sentence N+1 synthesizes
+      // back-to-back behind N with zero idle. Dedupes via prefetchSentence's
+      // pendingPrefetch/audioCache guards.
+      maybePrefetchAhead(idx, voice, speed);
       return;
     }
 
@@ -1444,6 +1505,11 @@
         maybePrefetchAhead(idx, voice, speed);
       }
     );
+    // Eager kick-ahead: queue sentence N+1 the moment N's request is committed
+    // (synchronously, before N's callback fires), so the serial synth queue runs
+    // them back-to-back. Harmlessly re-run on playback start; prefetchSentence
+    // dedupes via its pendingPrefetch/audioCache guards.
+    maybePrefetchAhead(idx, voice, speed);
   }
 
   function pausePlayback() {

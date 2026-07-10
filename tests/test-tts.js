@@ -355,8 +355,170 @@ describe('splitLongSentenceText', () => {
 
   it('adds a source-contract check that content.js applies chunking at the assignment site', () => {
     const contentJs = fs.readFileSync(path.join(rootDir, 'content', 'content.js'), 'utf8');
-    assert.match(contentJs, /pbSentences = selected\.flatMap\(splitLongSentence\)/);
+    // The long-after-short pre-pass runs BEFORE flatMap(splitLongSentence) so the
+    // 160-char hard chunking still applies to any monster halves it produces.
+    assert.match(contentJs, /pbSentences = splitLongAfterShort\(selected\)\.flatMap\(splitLongSentence\)/);
     assert.match(contentJs, /SENTENCE_CHUNK_LIMIT = 160/);
+  });
+});
+
+// ── splitLongAfterShort (mirrors content.js) ─────────────────────────
+// Pre-pass: a SHORT sentence (<90) followed by a LONG one (>200) splits the
+// long follower at the first clause boundary (, ; or —) at/after its midpoint,
+// with continuation: true on the second half (no mid-sentence pause). No such
+// boundary → left alone.
+function splitLongAfterShort(sentences) {
+  const out = [];
+  for (let i = 0; i < sentences.length; i++) {
+    const s = sentences[i];
+    const prev = sentences[i - 1];
+    if (prev && typeof prev.text === 'string' && prev.text.length < 90 &&
+        s && typeof s.text === 'string' && s.text.length > 200) {
+      const half = Math.floor(s.text.length / 2);
+      const rel = s.text.slice(half).search(/[,;—]/);
+      if (rel !== -1) {
+        const cut = half + rel;
+        out.push({ ...s, text: s.text.slice(0, cut + 1).trim() });
+        out.push({ ...s, text: s.text.slice(cut + 1).trim(), continuation: true });
+        continue;
+      }
+    }
+    out.push(s);
+  }
+  return out;
+}
+
+describe('splitLongAfterShort', () => {
+  const short = { text: 'A short one.' };                       // 12 chars
+  // A long sentence (>200) whose only clause boundary sits well past the midpoint.
+  const longWithLateComma =
+    { text: 'x'.repeat(140) + ', ' + 'y'.repeat(120) };         // comma at idx 140, len 262, mid 131
+
+  it('splits a long sentence following a short one at the first boundary past the midpoint', () => {
+    const out = splitLongAfterShort([short, longWithLateComma]);
+    assert.equal(out.length, 3);
+    assert.equal(out[0], short);                                 // short untouched
+    assert.equal(out[1].text, 'x'.repeat(140) + ',');           // first half keeps the comma
+    assert.equal(out[1].continuation, undefined);               // first half is NOT a continuation
+    assert.equal(out[2].text, 'y'.repeat(120));
+    assert.equal(out[2].continuation, true);                    // second half suppresses the pause
+  });
+
+  it('leaves the long sentence alone when its only comma is before the midpoint', () => {
+    const early = { text: 'x'.repeat(20) + ', ' + 'y'.repeat(220) }; // comma at 20, len 242, mid 121
+    const out = splitLongAfterShort([short, early]);
+    assert.equal(out.length, 2);
+    assert.equal(out[1], early);
+  });
+
+  it('does not split when the preceding sentence is not short (long → long)', () => {
+    const long1 = { text: 'a'.repeat(210) };
+    const out = splitLongAfterShort([long1, longWithLateComma]);
+    assert.equal(out.length, 2);
+    assert.equal(out[1], longWithLateComma);
+  });
+
+  it('does not split a long sentence that has no clause boundary at all', () => {
+    const noBoundary = { text: 'a'.repeat(260) }; // no , ; or —
+    const out = splitLongAfterShort([short, noBoundary]);
+    assert.equal(out.length, 2);
+    assert.equal(out[1], noBoundary);
+  });
+
+  it('does not split when the follower is not long enough (>200 required)', () => {
+    const notLong = { text: 'x'.repeat(100) + ', ' + 'y'.repeat(98) }; // len 200 — NOT > 200
+    const out = splitLongAfterShort([short, notLong]);
+    assert.equal(out.length, 2);
+    assert.equal(out[1], notLong);
+  });
+
+  it('respects the short boundary: a 90-char predecessor is NOT short', () => {
+    const exactly90 = { text: 'p'.repeat(90) };
+    const out = splitLongAfterShort([exactly90, longWithLateComma]);
+    assert.equal(out.length, 2, '90 chars is not < 90, so no split');
+  });
+
+  it('accepts a semicolon or em-dash as the split boundary', () => {
+    const semi = { text: 'x'.repeat(140) + '; ' + 'y'.repeat(120) };
+    const dash = { text: 'x'.repeat(140) + '— ' + 'y'.repeat(120) };
+    assert.equal(splitLongAfterShort([short, semi]).length, 3);
+    assert.equal(splitLongAfterShort([short, dash]).length, 3);
+  });
+
+  it('the two halves lose no words (concatenate back to the original clauses)', () => {
+    const out = splitLongAfterShort([short, longWithLateComma]);
+    assert.equal(out[1].text + ' ' + out[2].text, longWithLateComma.text);
+  });
+
+  it('leaves a lone or leading long sentence untouched (no short predecessor)', () => {
+    const out = splitLongAfterShort([longWithLateComma]);
+    assert.equal(out.length, 1);
+    assert.equal(out[0], longWithLateComma);
+  });
+
+  it('source contract: content.js defines splitLongAfterShort with the < 90 / > 200 gates', () => {
+    const contentJs = fs.readFileSync(path.join(rootDir, 'content', 'content.js'), 'utf8');
+    assert.match(contentJs, /function splitLongAfterShort\(sentences\)/);
+    assert.match(contentJs, /prev\.text\.length < 90/);
+    assert.match(contentJs, /s\.text\.length > 200/);
+    assert.match(contentJs, /continuation: true/);
+  });
+});
+
+// ── Prefetch pipeline: eager kickoff + continuous work-ahead (source contracts) ──
+// Pins the pipeline structurally: sentence N+1 is queued the instant N's request
+// is committed (eager), and each prefetch completion self-refills the queue via
+// topUpPrefetch, bounded to 2 in-flight so skips don't flood the synth queue.
+describe('content.js prefetch pipeline contracts', () => {
+  const contentJs = fs.readFileSync(path.join(rootDir, 'content', 'content.js'), 'utf8');
+
+  it('raises AUDIO_CACHE_LIMIT to 64 so a whole selection can cache', () => {
+    assert.match(contentJs, /const AUDIO_CACHE_LIMIT = 64;/);
+  });
+
+  it('defines topUpPrefetch, bounded to 2 in-flight prefetches, scanning after pbIndex', () => {
+    const fn = contentJs.match(/function topUpPrefetch\(voice, speed\)\s*\{([\s\S]*?)\n {2}\}/);
+    assert.ok(fn, 'topUpPrefetch not found');
+    assert.match(fn[1], /pendingPrefetch\.size >= 2/, 'topUp must do nothing when 2 prefetches are already in flight');
+    assert.match(fn[1], /for \(let idx = pbIndex \+ 1; idx < pbSentences\.length; idx\+\+\)/, 'topUp must scan forward from pbIndex+1 so a skip re-anchors the pipeline');
+    assert.match(fn[1], /audioCache\.has\(idx\) \|\| pendingPrefetch\.has\(idx\)/, 'topUp must skip already-cached / already-pending indices');
+    assert.match(fn[1], /prefetchSentence\(idx, voice, speed\)/);
+  });
+
+  it('calls topUpPrefetch from prefetchSentence success path, after the waiter resolution', () => {
+    const fn = contentJs.match(/function prefetchSentence\(idx, voice, speed\)\s*\{([\s\S]*?)\n {2}\}/);
+    assert.ok(fn, 'prefetchSentence not found');
+    const body = fn[1];
+    const cacheAt = body.indexOf('setCachedAudio(idx, voice, speed, response.audioDataUrl)');
+    const waiterAt = body.indexOf('if (waiter) waiter(response.audioDataUrl)');
+    const topUpAt = body.indexOf('topUpPrefetch(voice, speed)');
+    assert.ok(cacheAt !== -1 && waiterAt !== -1 && topUpAt !== -1, 'success-path cache/waiter/topUp all present');
+    assert.ok(cacheAt < waiterAt && waiterAt < topUpAt, 'topUp must run after setCachedAudio and waiter resolution');
+  });
+
+  it('topUp is reached only in the non-stale success branch (after the stale/cancel guard returns)', () => {
+    const fn = contentJs.match(/function prefetchSentence\(idx, voice, speed\)\s*\{([\s\S]*?)\n {2}\}/);
+    assert.ok(fn, 'prefetchSentence not found');
+    const body = fn[1];
+    const guardAt = body.indexOf('token.cancelled || myGen !== prefetchGeneration');
+    const topUpAt = body.indexOf('topUpPrefetch(voice, speed)');
+    assert.ok(guardAt !== -1 && topUpAt !== -1);
+    assert.ok(guardAt < topUpAt, 'the stale/cancel guard must precede the topUp call');
+  });
+
+  it('eagerly kicks maybePrefetchAhead in BOTH of playSentence request paths (join + fresh send)', () => {
+    const playSentenceBody = contentJs.match(/function playSentence\(idx\)\s*\{([\s\S]*?)\n {2}function pausePlayback\(\)/);
+    assert.ok(playSentenceBody, 'playSentence body not found');
+    const body = playSentenceBody[1];
+    // Join branch: eager kick before its return, after registering the waiter.
+    const joinAt = body.indexOf('pending.waiter = (audioDataUrl) =>');
+    // Fresh send: the direct tts-request path.
+    const freshSendAt = body.indexOf('inflightTtsIds.add(clientRequestId)');
+    // Eager kicks: the cache-hit path already had one; count the request-path ones.
+    const eager = body.match(/maybePrefetchAhead\(idx, voice, speed\)/g) || [];
+    assert.ok(joinAt !== -1 && freshSendAt !== -1);
+    // cache-hit + join-success-waiter + join-eager + fresh-success-callback + fresh-eager = 5 sites.
+    assert.ok(eager.length >= 5, `expected >=5 maybePrefetchAhead sites in playSentence, found ${eager.length}`);
   });
 });
 
