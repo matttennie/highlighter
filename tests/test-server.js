@@ -155,9 +155,20 @@ describe('server/kokoro_server.py', () => {
     assert.match(source, /threading\.Thread\(target=_idle_unload_loop,\s*daemon=True\)/);
   });
 
-  it('serializes synthesis behind a single inference lock', () => {
-    assert.match(source, /_synth_lock\s*=\s*threading\.Lock\(\)/);
-    assert.match(source, /with _synth_lock:/);
+  it('caps concurrent synthesis with a semaphore, tunable via KOKORO_CONCURRENCY', () => {
+    assert.match(source, /KOKORO_CONCURRENCY/);
+    assert.match(source, /CONCURRENCY\s*=\s*int\(os\.environ\.get\(\s*["']KOKORO_CONCURRENCY["']\s*,\s*["']2["']\s*\)\)/);
+    assert.match(source, /_synth_sem\s*=\s*threading\.Semaphore\(CONCURRENCY\)/);
+    assert.match(source, /with _synth_sem:/);
+  });
+
+  it('builds a session with a capped intra-op thread pool via from_session, tunable via KOKORO_INTRA_THREADS', () => {
+    assert.match(source, /KOKORO_INTRA_THREADS/);
+    assert.match(source, /import onnxruntime as rt/);
+    assert.match(source, /so\s*=\s*rt\.SessionOptions\(\)/);
+    assert.match(source, /so\.intra_op_num_threads\s*=\s*INTRA_THREADS/);
+    assert.match(source, /rt\.InferenceSession\(MODEL_PATH,\s*so,\s*providers=\["CPUExecutionProvider"\]\)/);
+    assert.match(source, /Kokoro\.from_session\(sess,\s*VOICES_PATH\)/);
   });
 
   it('guards model load with its own lock (thread-safe lazy load)', () => {

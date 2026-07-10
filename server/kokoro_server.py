@@ -30,9 +30,13 @@ a real request. A background thread unloads the model (frees the
 kokoro-onnx session, drops the reference, garbage-collects) after
 MODEL_IDLE_UNLOAD_SECONDS (15 minutes) with no synthesis activity — the
 HTTP listener itself is never torn down, so the next request just pays a
-cold-load again. Synthesis is serialized behind a single lock: kokoro-onnx
-runs one inference at a time faster than two interleaved ones fight over
-the same session.
+cold-load again. Synthesis concurrency is capped by a semaphore
+(KOKORO_CONCURRENCY, default 2): onnxruntime's InferenceSession.run() is
+thread-safe for concurrent calls, so a few requests can share one session
+at once rather than serializing behind a single lock. To avoid the
+concurrent runs fighting over all CPU cores, the session's intra-op thread
+pool is capped (KOKORO_INTRA_THREADS, default half the CPU count) instead
+of the onnxruntime default of using every core per run.
 """
 
 import base64
@@ -81,6 +85,12 @@ MAX_BODY_BYTES = 64 * 1024
 MODEL_IDLE_UNLOAD_SECONDS = 15 * 60
 IDLE_CHECK_INTERVAL_SECONDS = 30
 
+# Concurrent synthesis: N requests may run inference at once, each on an
+# intra_op-limited session so they don't fight over all cores. See
+# server/kokoro_server.py module docstring for the tuning rationale.
+CONCURRENCY = int(os.environ.get("KOKORO_CONCURRENCY", "2"))
+INTRA_THREADS = int(os.environ.get("KOKORO_INTRA_THREADS", str(max(2, (os.cpu_count() or 4) // 2))))
+
 # voice-id prefix -> (display category, kokoro-onnx `lang` code for create())
 PREFIX_INFO = {
     "af": ("English (US)", "en-us"),
@@ -118,9 +128,9 @@ def lang_for_voice(voice_id):
 # --- Model lifecycle ---------------------------------------------------
 
 _kokoro = None
-_load_lock = threading.Lock()   # guards lazy-load / unload of _kokoro
-_synth_lock = threading.Lock()  # serializes inference: one synth at a time
-_last_activity = None           # monotonic time of last completed synthesis
+_load_lock = threading.Lock()          # guards lazy-load / unload of _kokoro
+_synth_sem = threading.Semaphore(CONCURRENCY)  # caps concurrent inferences
+_last_activity = None                   # monotonic time of last completed synthesis
 
 
 def _log(method, path, chars, elapsed_ms):
@@ -130,7 +140,7 @@ def _log(method, path, chars, elapsed_ms):
 
 def _warmup(kokoro):
     """Pay ONNX Runtime's one-time first-call session cost now."""
-    with _synth_lock:
+    with _synth_sem:
         kokoro.create(WARMUP_TEXT, voice=WARMUP_VOICE, speed=1.0, lang=WARMUP_LANG)
 
 
@@ -145,9 +155,13 @@ def ensure_model_loaded():
                 raise RuntimeError(
                     "kokoro model files not found (expected %s and %s) - run "
                     "server/install.sh" % (MODEL_PATH, VOICES_PATH))
+            import onnxruntime as rt
             from kokoro_onnx import Kokoro
             t0 = time.time()
-            kokoro = Kokoro(MODEL_PATH, VOICES_PATH)
+            so = rt.SessionOptions()
+            so.intra_op_num_threads = INTRA_THREADS
+            sess = rt.InferenceSession(MODEL_PATH, so, providers=["CPUExecutionProvider"])
+            kokoro = Kokoro.from_session(sess, VOICES_PATH)
             _warmup(kokoro)
             print("kokoro_server: model loaded + warmed in %.2fs" % (time.time() - t0),
                   file=sys.stderr, flush=True)
@@ -198,7 +212,7 @@ def synthesize_wav_base64(text, voice, speed):
         voice = DEFAULT_VOICE
     lang = lang_for_voice(voice)
 
-    with _synth_lock:
+    with _synth_sem:
         samples, sample_rate = kokoro.create(text, voice=voice, speed=speed, lang=lang)
     _mark_activity()
 
