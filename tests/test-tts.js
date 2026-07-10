@@ -622,3 +622,138 @@ describe('content.js join-in-flight-prefetch contracts', () => {
     );
   });
 });
+
+// ── Inter-sentence pacing: pauseBeforeNext (mirrors content.js) ──────
+// 0.25s between sentences, 0.5s at paragraph breaks (different block
+// elements), and NO pause between chunks of a single long sentence — those
+// are mid-sentence, not sentence boundaries. Applies only to automatic
+// advancement (onAudioEnded); user-initiated skip/play stay instant.
+
+const SENTENCE_PAUSE_MS = 250;
+const PARAGRAPH_PAUSE_MS = 500;
+
+// Pause inserted before auto-advancing to the next entry: none inside a
+// split long sentence, longer at paragraph boundaries.
+function pauseBeforeNext(prev, next) {
+  if (!prev || !next) return 0;
+  if (next.continuation) return 0;
+  if (prev.blockIdx !== next.blockIdx) return PARAGRAPH_PAUSE_MS;
+  return SENTENCE_PAUSE_MS;
+}
+
+describe('pauseBeforeNext', () => {
+  it('returns 0 when next is a continuation chunk of a split long sentence', () => {
+    assert.equal(pauseBeforeNext({ blockIdx: 0 }, { blockIdx: 0, continuation: true }), 0);
+    // Even across a block boundary, a continuation chunk must still be 0 —
+    // continuation always wins over the block comparison.
+    assert.equal(pauseBeforeNext({ blockIdx: 0 }, { blockIdx: 1, continuation: true }), 0);
+  });
+
+  it('returns PARAGRAPH_PAUSE_MS (500) when the boundary crosses block elements', () => {
+    assert.equal(pauseBeforeNext({ blockIdx: 0 }, { blockIdx: 1 }), PARAGRAPH_PAUSE_MS);
+    assert.equal(pauseBeforeNext({ blockIdx: 0 }, { blockIdx: 1 }), 500);
+  });
+
+  it('returns SENTENCE_PAUSE_MS (250) within the same block', () => {
+    assert.equal(pauseBeforeNext({ blockIdx: 2 }, { blockIdx: 2 }), SENTENCE_PAUSE_MS);
+    assert.equal(pauseBeforeNext({ blockIdx: 2 }, { blockIdx: 2 }), 250);
+  });
+
+  it('returns 0 when prev is null or undefined', () => {
+    assert.equal(pauseBeforeNext(null, { blockIdx: 0 }), 0);
+    assert.equal(pauseBeforeNext(undefined, { blockIdx: 0 }), 0);
+  });
+
+  it('returns 0 when next is null or undefined', () => {
+    assert.equal(pauseBeforeNext({ blockIdx: 0 }, null), 0);
+    assert.equal(pauseBeforeNext({ blockIdx: 0 }, undefined), 0);
+  });
+
+  it('returns 0 when both prev and next are missing', () => {
+    assert.equal(pauseBeforeNext(null, null), 0);
+    assert.equal(pauseBeforeNext(undefined, undefined), 0);
+  });
+});
+
+// ── content.js source contracts for inter-sentence pacing ────────────
+describe('content.js inter-sentence pacing contracts', () => {
+  const contentJs = fs.readFileSync(path.join(rootDir, 'content', 'content.js'), 'utf8');
+
+  it('defines the pacing constants at the documented values', () => {
+    assert.match(contentJs, /const SENTENCE_PAUSE_MS = 250;/);
+    assert.match(contentJs, /const PARAGRAPH_PAUSE_MS = 500;/);
+  });
+
+  it('mirrors pauseBeforeNext byte-for-byte', () => {
+    assert.match(
+      contentJs,
+      /function pauseBeforeNext\(prev, next\) \{\s*if \(!prev \|\| !next\) return 0;\s*if \(next\.continuation\) return 0;\s*if \(prev\.blockIdx !== next\.blockIdx\) return PARAGRAPH_PAUSE_MS;\s*return SENTENCE_PAUSE_MS;\s*\}/,
+      'pauseBeforeNext in content.js must match the test mirror exactly',
+    );
+  });
+
+  it('stamps every sentence with blockIdx in collectSentences using a per-block counter', () => {
+    const fn = contentJs.match(
+      /function collectSentences\(\)\s*\{([\s\S]*?)\n {2}\}/,
+    );
+    assert.ok(fn, 'collectSentences not found');
+    assert.match(fn[1], /let blockIdx\s*=\s*0;/, 'collectSentences must maintain a per-block counter');
+    assert.match(fn[1], /s\.blockIdx = blockIdx/, 'every pushed sentence must be stamped with blockIdx');
+    assert.match(fn[1], /blockIdx\+\+/, 'the counter must advance per block whose sentences get extracted');
+  });
+
+  it('marks chunks after the first as continuation in splitLongSentence', () => {
+    const fn = contentJs.match(
+      /function splitLongSentence\(sentence\)\s*\{([\s\S]*?)\n {2}\}/,
+    );
+    assert.ok(fn, 'splitLongSentence not found');
+    assert.match(
+      fn[1],
+      /\.map\(\(chunkText, chunkIndex\) => \(\{ \.\.\.sentence, text: chunkText, continuation: chunkIndex > 0 \}\)\)/,
+      'splitLongSentence must stamp continuation: chunkIndex > 0 on every chunk',
+    );
+  });
+
+  it('onAudioEnded computes the pause via pauseBeforeNext and advances immediately when it is 0', () => {
+    const fn = contentJs.match(
+      /function onAudioEnded\(\)\s*\{([\s\S]*?)\n {2}\}/,
+    );
+    assert.ok(fn, 'onAudioEnded not found');
+    assert.match(
+      fn[1],
+      /const pause = pauseBeforeNext\(pbSentences\[pbIndex\], pbSentences\[pbIndex \+ 1\]\);/,
+    );
+  });
+
+  it('onAudioEnded schedules the advance with full requestId race protection when pause > 0', () => {
+    const fn = contentJs.match(
+      /function onAudioEnded\(\)\s*\{([\s\S]*?)\n {2}\}/,
+    );
+    assert.ok(fn, 'onAudioEnded not found');
+    assert.match(fn[1], /const reqAtEnd = pbRequestId;/);
+    assert.match(fn[1], /clearTimeout\(advanceTimer\);/);
+    assert.match(
+      fn[1],
+      /advanceTimer = setTimeout\(\(\) => \{\s*advanceTimer = 0;\s*if \(reqAtEnd !== pbRequestId\) return; \/\/ superseded during the pause\s*playSentence\(pbIndex \+ 1\);\s*\}, pause\);/,
+      'the scheduled advance must re-check pbRequestId before calling playSentence, guarding against skip/stop/re-stroke/menu-change during the pause',
+    );
+  });
+
+  it('declares advanceTimer as module state initialized to 0', () => {
+    assert.match(contentJs, /let advanceTimer = 0;/);
+  });
+
+  it('stopPlayback clears advanceTimer (belt and braces on top of the requestId guard)', () => {
+    assert.match(
+      contentJs,
+      /function stopPlayback\(\)\s*\{[\s\S]*?clearTimeout\(advanceTimer\);\s*advanceTimer = 0;[\s\S]*?setPlaybackState\('idle'\);/,
+    );
+  });
+
+  it('hidePlayer routes through stopPlayback so no advanceTimer leaks on close', () => {
+    assert.match(
+      contentJs,
+      /function hidePlayer\(\)\s*\{[\s\S]*?stopPlayback\(\);/,
+    );
+  });
+});

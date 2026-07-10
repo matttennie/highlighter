@@ -30,6 +30,11 @@
   // CPUs. Longer sentences are split at clause boundaries so nothing is lost;
   // the chunks share the original sentence's Range, so highlighting is unaffected.
   const SENTENCE_CHUNK_LIMIT = 160;
+  // Natural playback pacing: brief pause between sentences, longer at
+  // paragraph breaks. Applies only to automatic advancement (onAudioEnded) —
+  // user-initiated skip/play remain instant.
+  const SENTENCE_PAUSE_MS = 250;
+  const PARAGRAPH_PAUSE_MS = 500;
 
   // ── State ──────────────────────────────────────────────────────────
   let highlightMode = false;
@@ -90,6 +95,7 @@
   let prefetchGeneration = 0;        // bumped on voice/speed change to drop stale results
   let skipDebounceTimer = 0;
   let pendingSkipTarget = -1;
+  let advanceTimer = 0; // scheduled auto-advance during a between-sentence pause
 
   function logDebug(event, details = {}) {
     const payload = {
@@ -462,13 +468,16 @@
       return [sentence];
     }
     return splitLongSentenceText(sentence.text, SENTENCE_CHUNK_LIMIT)
-      .map((chunkText) => ({ ...sentence, text: chunkText }));
+      .map((chunkText, chunkIndex) => ({ ...sentence, text: chunkText, continuation: chunkIndex > 0 }));
   }
 
   // ── Sentence collection ────────────────────────────────────────────
   function collectSentences() {
     const results = [];
     const seen    = new Set();
+    // Per-block counter — sentences from the same block share this value so
+    // pauseBeforeNext can tell a paragraph break from a sentence boundary.
+    let blockIdx  = 0;
 
     const root = articleModeEnabled ? getContentRoot() : document.body;
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
@@ -481,7 +490,9 @@
       if (!isElementVisible(block)) continue;
       if (articleModeEnabled && isNonContent(block)) continue;
       const sents = extractSentencesFromBlock(block);
-      for (const s of sents) results.push(s);
+      if (!sents.length) continue;
+      for (const s of sents) { s.blockIdx = blockIdx; results.push(s); }
+      blockIdx++;
     }
 
     results.sort((a, b) => a.startLineY - b.startLineY);
@@ -1603,6 +1614,9 @@
   function stopPlayback() {
     logDebug('playback-stop');
     pbRequestId++; // invalidate in-flight requests
+    // Belt and braces on top of the requestId guard: also cancel any pause
+    // scheduled by onAudioEnded so it can't fire after playback has stopped.
+    clearTimeout(advanceTimer); advanceTimer = 0;
     cancelInflightTts(); // Wave B: skip any still-queued offscreen synths
     // FIX 3: Properly release audio resources
     releaseCurrentAudioElement();
@@ -1632,9 +1646,35 @@
     releaseAudioObjectUrl();
   }
 
+  // Pause inserted before auto-advancing to the next entry: none inside a
+  // split long sentence, longer at paragraph boundaries.
+  function pauseBeforeNext(prev, next) {
+    if (!prev || !next) return 0;
+    if (next.continuation) return 0;
+    if (prev.blockIdx !== next.blockIdx) return PARAGRAPH_PAUSE_MS;
+    return SENTENCE_PAUSE_MS;
+  }
+
   function onAudioEnded() {
     if (pbIndex < pbSentences.length - 1) {
-      playSentence(pbIndex + 1);
+      const pause = pauseBeforeNext(pbSentences[pbIndex], pbSentences[pbIndex + 1]);
+      if (!pause) {
+        playSentence(pbIndex + 1);
+        return;
+      }
+      // Between-sentence/paragraph pause: schedule the advance, but re-check
+      // pbRequestId when it fires — the user may skip, stop, re-stroke, or
+      // change voice/speed during the pause window, and every one of those
+      // paths (except a mid-'playing' voice/speed change, which intentionally
+      // falls through to synthesize the next sentence in the new voice) bumps
+      // pbRequestId.
+      const reqAtEnd = pbRequestId;
+      clearTimeout(advanceTimer);
+      advanceTimer = setTimeout(() => {
+        advanceTimer = 0;
+        if (reqAtEnd !== pbRequestId) return; // superseded during the pause
+        playSentence(pbIndex + 1);
+      }, pause);
     } else {
       // All sentences done — reset
       setPlaybackState('idle');
