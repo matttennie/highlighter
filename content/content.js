@@ -532,19 +532,48 @@
   // ICU sentence segmentation via the platform — keeps decimals (3.14),
   // filenames (content.js), versions (v1.0.onnx) and abbreviations-before-
   // lowercase (e.g. the docs) intact, where the old regex fractured them.
-  // ponytail: V8's ICU ships no suppression dictionary, so an abbreviation
-  // followed by a capital ("Dr. Smith", "U.S. Government") still splits.
+  // V8's ICU carries no abbreviation suppressions — merge a segment into its
+  // follower when it ends in a known abbreviation (ICU splits "Dr. Smith").
+  // ponytail: naive heuristic — merges ANY segment ending in a listed
+  // abbreviation into its follower, even on the rare case where the
+  // abbreviation genuinely ends the sentence (e.g. a trailing "p.m."
+  // immediately followed by a new sentence over-merges). Upgrade to
+  // class-scoped suppression (titles vs. units) if that shows up in practice.
   // Returns [{ text, start, end }] with offsets into the input string;
   // `text` is trimmed, offsets cover the raw (untrimmed) segment.
+  const ABBREVIATIONS = new Set([
+    'dr.', 'mr.', 'mrs.', 'ms.', 'prof.', 'rev.', 'gen.', 'sen.', 'rep.',
+    'st.', 'mt.', 'ft.', 'jr.', 'sr.', 'no.', 'vs.', 'etc.', 'e.g.', 'i.e.',
+    'inc.', 'ltd.', 'co.', 'corp.', 'dept.', 'est.', 'approx.', 'a.m.', 'p.m.',
+    'u.s.', 'u.k.', 'u.n.', 'd.c.',
+  ]);
   const sentenceSegmenter = new Intl.Segmenter('en', { granularity: 'sentence' });
   function segmentSentences(text) {
-    const results = [];
+    const raw = [];
     for (const seg of sentenceSegmenter.segment(text)) {
+      raw.push({ start: seg.index, end: seg.index + seg.segment.length });
+    }
+
+    // Merge a segment into its follower when it ends in a known abbreviation;
+    // apply iteratively so chains collapse ("J. R. R. Tolkien" → one segment).
+    for (let i = 0; i < raw.length - 1; ) {
+      const words = text.slice(raw[i].start, raw[i].end).trim().split(/\s+/);
+      const lastWord = words[words.length - 1].toLowerCase();
+      if (ABBREVIATIONS.has(lastWord) || /^[a-z]\.$/.test(lastWord)) {
+        raw[i] = { start: raw[i].start, end: raw[i + 1].end };
+        raw.splice(i + 1, 1);
+      } else {
+        i++;
+      }
+    }
+
+    const results = [];
+    for (const { start, end } of raw) {
       // Drop pure-punctuation/whitespace segments (":)", stray marks) — TTS
       // engines either error or pronounce them literally ("colon close-paren").
-      const trimmed = stripLeadingNoise(seg.segment.trim());
+      const trimmed = stripLeadingNoise(text.slice(start, end).trim());
       if (!hasReadableContent(trimmed)) continue;
-      results.push({ text: trimmed, start: seg.index, end: seg.index + seg.segment.length });
+      results.push({ text: trimmed, start, end });
     }
     return results;
   }

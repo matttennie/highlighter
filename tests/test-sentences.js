@@ -5,10 +5,11 @@
  * content.js#segmentSentences — keep it in sync.
  *
  * These tests EXECUTE real Intl.Segmenter output (Node ships ICU too), so they
- * document actual behavior, not the ideal. Known ICU limitation: V8 ships no
- * abbreviation-suppression dictionary, so an abbreviation followed by a capital
- * ("Dr. Smith", "U.S. Government") still splits. Cases where ICU deviates from
- * the old regex are called out inline.
+ * document actual behavior, not the ideal. V8's ICU ships no abbreviation-
+ * suppression dictionary, so an abbreviation followed by a capital
+ * ("Dr. Smith", "U.S. Government") still splits at the ICU layer — a post-pass
+ * merges the split back together for known abbreviations. Cases where ICU
+ * deviates from the old regex are called out inline.
  */
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
@@ -22,15 +23,39 @@ function stripLeadingNoise(text) {
   return text.replace(/^[^\p{L}\p{N}"'(\[«„“‘]+/u, '');
 }
 
+const ABBREVIATIONS = new Set([
+  'dr.', 'mr.', 'mrs.', 'ms.', 'prof.', 'rev.', 'gen.', 'sen.', 'rep.',
+  'st.', 'mt.', 'ft.', 'jr.', 'sr.', 'no.', 'vs.', 'etc.', 'e.g.', 'i.e.',
+  'inc.', 'ltd.', 'co.', 'corp.', 'dept.', 'est.', 'approx.', 'a.m.', 'p.m.',
+  'u.s.', 'u.k.', 'u.n.', 'd.c.',
+]);
 const sentenceSegmenter = new Intl.Segmenter('en', { granularity: 'sentence' });
 function segmentSentences(text) {
-  const results = [];
+  const raw = [];
   for (const seg of sentenceSegmenter.segment(text)) {
+    raw.push({ start: seg.index, end: seg.index + seg.segment.length });
+  }
+
+  // Merge a segment into its follower when it ends in a known abbreviation;
+  // apply iteratively so chains collapse ("J. R. R. Tolkien" → one segment).
+  for (let i = 0; i < raw.length - 1; ) {
+    const words = text.slice(raw[i].start, raw[i].end).trim().split(/\s+/);
+    const lastWord = words[words.length - 1].toLowerCase();
+    if (ABBREVIATIONS.has(lastWord) || /^[a-z]\.$/.test(lastWord)) {
+      raw[i] = { start: raw[i].start, end: raw[i + 1].end };
+      raw.splice(i + 1, 1);
+    } else {
+      i++;
+    }
+  }
+
+  const results = [];
+  for (const { start, end } of raw) {
     // Drop pure-punctuation/whitespace segments (":)", stray marks) — TTS
     // engines either error or pronounce them literally ("colon close-paren").
-    const trimmed = stripLeadingNoise(seg.segment.trim());
+    const trimmed = stripLeadingNoise(text.slice(start, end).trim());
     if (!hasReadableContent(trimmed)) continue;
-    results.push({ text: trimmed, start: seg.index, end: seg.index + seg.segment.length });
+    results.push({ text: trimmed, start, end });
   }
   return results;
 }
@@ -44,10 +69,39 @@ describe('ICU sentence segmentation', () => {
     assert.deepEqual(texts('This is one. This is two.'), ['This is one.', 'This is two.']);
   });
 
-  // KNOWN ICU LIMITATION: ideal is 2, but V8's ICU has no suppression dict, so
-  // "Dr." before a capital splits. Asserting observed behavior (3), not ideal.
-  it('splits an abbreviation before a capital (Dr. Smith) — known ICU limitation', () => {
-    assert.equal(texts('Dr. Smith went home. He slept.').length, 3);
+  // ICU splits "Dr." before the capitalized "Smith" into its own segment; the
+  // abbreviation merge pass fuses it back into one sentence.
+  it('merges an abbreviation before a capital (Dr. Smith)', () => {
+    assert.deepEqual(texts('Dr. Smith went home. He slept.'),
+      ['Dr. Smith went home.', 'He slept.']);
+  });
+
+  it('merges "U.S." before a capital (U.S. Government)', () => {
+    assert.deepEqual(texts('U.S. Government announced. Then acted.'),
+      ['U.S. Government announced.', 'Then acted.']);
+  });
+
+  it('collapses a chain of single-letter initials (J. R. R. Tolkien)', () => {
+    assert.deepEqual(texts('J. R. R. Tolkien wrote books. They sold well.'),
+      ['J. R. R. Tolkien wrote books.', 'They sold well.']);
+  });
+
+  it('merges "Inc." before a capital (Acme Inc.)', () => {
+    assert.deepEqual(texts('Acme Inc. filed reports. Then rested.'),
+      ['Acme Inc. filed reports.', 'Then rested.']);
+  });
+
+  it('does not merge a real sentence end that is not a known abbreviation (doctor.)', () => {
+    assert.deepEqual(texts('I met the doctor. He was kind.'),
+      ['I met the doctor.', 'He was kind.']);
+  });
+
+  // ponytail known ceiling: the merge heuristic can't tell "p.m." ending a real
+  // sentence from an abbreviation that continues one — it always merges into
+  // the follower, so a genuinely new sentence right after "p.m."/"a.m." gets
+  // fused in. Documenting the observed trade-off, not the ideal.
+  it('over-merges a trailing time abbreviation into the next sentence — known trade-off', () => {
+    assert.deepEqual(texts('Meet at 5 p.m. Bring snacks.'), ['Meet at 5 p.m. Bring snacks.']);
   });
 
   it('keeps "e.g." before lowercase intact', () => {
