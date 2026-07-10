@@ -10,3 +10,7 @@ playwright-report/
 test-results/
 offscreen/tts-engine.bundle.js
 offscreen/ort/
+.superpowers/
+kokoro-extension-test/
+server/.venv/
+__pycache__/
