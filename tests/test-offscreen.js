@@ -7,13 +7,6 @@ const rootDir = path.resolve(import.meta.dirname, '..');
 const engineJs = fs.readFileSync(path.join(rootDir, 'offscreen', 'tts-engine.js'), 'utf8');
 const offscreenHtml = fs.readFileSync(path.join(rootDir, 'offscreen', 'offscreen.html'), 'utf8');
 
-// Mirror of offscreen/tts-engine.js#clampSpeed — keep in sync.
-function clampSpeed(speed) {
-  const parsed = parseFloat(speed);
-  if (!Number.isFinite(parsed)) return 1.0;
-  return Math.max(0.5, Math.min(2.0, parsed));
-}
-
 describe('offscreen document', () => {
   it('loads the built bundle as a module, not the unbundled source', () => {
     assert.match(offscreenHtml, /<script type="module" src="tts-engine\.bundle\.js"><\/script>/);
@@ -116,20 +109,5 @@ describe('offscreen warmup + warm-status (Wave B)', () => {
 
   it('never touches chrome.storage — offscreen documents do not have access to it', () => {
     assert.doesNotMatch(engineJs, /chrome\.storage/);
-  });
-});
-
-describe('clampSpeed (offscreen mirror)', () => {
-  it('defaults invalid values to 1x', () => {
-    assert.equal(clampSpeed(undefined), 1);
-    assert.equal(clampSpeed('abc'), 1);
-    assert.equal(clampSpeed(NaN), 1);
-    assert.equal(clampSpeed(Infinity), 1);
-  });
-
-  it('clamps to the Kokoro range 0.5–2.0', () => {
-    assert.equal(clampSpeed(0.1), 0.5);
-    assert.equal(clampSpeed(1.7), 1.7);
-    assert.equal(clampSpeed(3), 2.0);
   });
 });

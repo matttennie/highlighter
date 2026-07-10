@@ -41,23 +41,12 @@ function getStoredDefaultVoice() {
   });
 }
 
-function redactDebugDetails(details) {
-  if (!details || typeof details !== 'object') return {};
-  const copy = { ...details };
-  for (const key of Object.keys(copy)) {
-    if (/^(token|secret|authorization|password)$/i.test(key)) {
-      copy[key] = copy[key] ? '[redacted]' : copy[key];
-    }
-  }
-  return copy;
-}
-
 function persistDebugEvent(source, event, details = {}) {
   const entry = {
     ts: new Date().toISOString(),
     source,
     event,
-    details: redactDebugDetails(details),
+    details,
   };
   debugLogBuffer.push(entry);
   scheduleLogFlush();
@@ -240,10 +229,7 @@ async function isNativeAvailable() {
     return nativeState.available;
   }
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), NATIVE_HEALTH_TIMEOUT_MS);
-    const res = await fetch(`${NATIVE_BASE_URL}/health`, { signal: controller.signal });
-    clearTimeout(timer);
+    const res = await fetch(`${NATIVE_BASE_URL}/health`, { signal: AbortSignal.timeout(NATIVE_HEALTH_TIMEOUT_MS) });
     nativeState = { available: res.ok, checkedAt: now };
   } catch {
     nativeState = { available: false, checkedAt: now };
@@ -489,19 +475,12 @@ async function handleTtsRequest({ text, voice, speed }, requestId = ++requestSeq
 
   if (await isNativeAvailable()) {
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), NATIVE_TTS_TIMEOUT_MS);
-      let res;
-      try {
-        res = await fetch(`${NATIVE_BASE_URL}/tts`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: normalizedText, voice: voiceId, speed: normalizedSpeed }),
-          signal: controller.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
+      const res = await fetch(`${NATIVE_BASE_URL}/tts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: normalizedText, voice: voiceId, speed: normalizedSpeed }),
+        signal: AbortSignal.timeout(NATIVE_TTS_TIMEOUT_MS),
+      });
       if (!res.ok) throw new Error(`native-http-${res.status}`);
       const payload = await res.json();
       if (!payload || typeof payload.audioContent !== 'string' || !payload.audioContent) {
@@ -546,14 +525,7 @@ async function handleVoicesRequest(requestId = ++requestSeq) {
 
   if (await isNativeAvailable()) {
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), NATIVE_TTS_TIMEOUT_MS);
-      let res;
-      try {
-        res = await fetch(`${NATIVE_BASE_URL}/voices`, { signal: controller.signal });
-      } finally {
-        clearTimeout(timer);
-      }
+      const res = await fetch(`${NATIVE_BASE_URL}/voices`, { signal: AbortSignal.timeout(NATIVE_TTS_TIMEOUT_MS) });
       if (!res.ok) throw new Error(`native-http-${res.status}`);
       const payload = await res.json();
       if (!payload || !Array.isArray(payload.voices)) throw new Error('native-bad-payload');

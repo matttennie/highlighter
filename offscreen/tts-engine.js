@@ -43,25 +43,17 @@ let activeSynths = 0;
 const cancelledIds = new Set();
 
 // Human labels for Kokoro's language codes (voice ids are prefixed, e.g.
-// af_* = American female, bm_* = British male).
+// af_* = American female, bm_* = British male). kokoro-js 1.2.1 ships only
+// English voices; the fallback below covers any languages added later.
 const LANGUAGE_LABELS = {
   'en-us': 'English (US)',
   'en-gb': 'English (UK)',
-  'es': 'Spanish',
-  'fr-fr': 'French',
-  'hi': 'Hindi',
-  'it': 'Italian',
-  'ja': 'Japanese',
-  'pt-br': 'Portuguese (BR)',
-  'zh': 'Chinese',
 };
 
-function pickBackend() {
-  // CPU/WASM only. WebGPU (both fp16 and fp32) produced audible artifacts
-  // on macOS Metal with this model — revisit when upstream kokoro-js/
-  // transformers.js WebGPU output is clean.
-  return { device: 'wasm', dtype: 'q8' };
-}
+// CPU/WASM only. WebGPU (both fp16 and fp32) produced audible artifacts
+// on macOS Metal with this model — revisit when upstream kokoro-js/
+// transformers.js WebGPU output is clean.
+const BACKEND = { device: 'wasm', dtype: 'q8' };
 
 function loadModel({ device, dtype }) {
   return KokoroTTS.from_pretrained(MODEL_ID, {
@@ -96,7 +88,7 @@ function requestBootInfo() {
 function ensureEngine() {
   if (initPromise) return initPromise;
   initPromise = (async () => {
-    const attempt = pickBackend();
+    const attempt = BACKEND;
     const bootInfo = await requestBootInfo();
     // Warm means the weights are already on disk from a prior load, so this
     // "download" is really a cache-backed wake-up.
@@ -129,13 +121,6 @@ function resolveVoice(requested) {
   return DEFAULT_VOICE_ID;
 }
 
-// Kokoro's ONNX graph accepts speeds in [0.5, 2.0].
-function clampSpeed(speed) {
-  const parsed = parseFloat(speed);
-  if (!Number.isFinite(parsed)) return 1.0;
-  return Math.max(0.5, Math.min(2.0, parsed));
-}
-
 function arrayBufferToBase64(buffer) {
   const bytes = new Uint8Array(buffer);
   let binary = '';
@@ -161,7 +146,7 @@ async function handleTts(msg) {
 
   const id = msg.clientRequestId;
   const voice = resolveVoice(typeof msg.voice === 'string' ? msg.voice.trim() : '');
-  const speed = clampSpeed(msg.speed);
+  const speed = msg.speed; // background normalizes speed before forwarding
   const run = synthQueue.then(async () => {
     // Wave B: if the caller cancelled this request while it waited in the queue,
     // skip it before starting synthesis — the real win is never spending 3-7s

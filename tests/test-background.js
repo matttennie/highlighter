@@ -150,7 +150,7 @@ describe('native-first routing', () => {
 
   it('caches native availability and probes /health with an abortable fetch', () => {
     assert.match(backgroundJs, /async function isNativeAvailable\(\)/);
-    assert.match(backgroundJs, /fetch\(`\$\{NATIVE_BASE_URL\}\/health`, \{ signal: controller\.signal \}\)/);
+    assert.match(backgroundJs, /fetch\(`\$\{NATIVE_BASE_URL\}\/health`, \{ signal: AbortSignal\.timeout\(NATIVE_HEALTH_TIMEOUT_MS\) \}\)/);
     assert.match(backgroundJs, /now - nativeState\.checkedAt < NATIVE_RECHECK_MS/);
   });
 

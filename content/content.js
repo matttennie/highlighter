@@ -13,11 +13,9 @@
   const DEFAULT_VOICE_ID = 'bf_emma';
   const CURSOR_SIZE      = 22;
   const LINE_TOLERANCE   = 14;  // for END line detection (confirmed working)
-  // Kokoro's supported synthesis range. 16 detents in 0.1 increments.
-  // Math.round avoids float-arithmetic drift (0.5 + 7*0.1 !== 1.2 in
-  // IEEE 754) that would break SPEEDS.indexOf checks.
-  const SPEEDS = Array.from({ length: 16 }, (_, i) => Math.round((0.5 + i * 0.1) * 100) / 100);
-  const SPEED_DEFAULT_INDEX = SPEEDS.indexOf(1.2); // 7
+  // Kokoro's supported synthesis range.
+  const SPEED_MIN = 0.5;
+  const SPEED_MAX = 2.0;
   const TTS_TIMEOUT_MS   = 35000; // FIX 7: response timeout
   const AUDIO_START_TIMEOUT_MS = 8000;
   const BASE64_CHUNK_SIZE = 8192;
@@ -679,7 +677,7 @@
       <div class="hltr-menu-row">
         <label class="hltr-menu-label">Speed</label>
         <div class="hltr-speed-row">
-          <input type="range" class="hltr-speed-slider" min="0" max="${SPEEDS.length - 1}" step="1" value="${SPEED_DEFAULT_INDEX}">
+          <input type="range" class="hltr-speed-slider" min="0.5" max="2" step="0.1" value="1.2">
           <span class="hltr-speed-label">1.2x</span>
         </div>
       </div>
@@ -701,13 +699,9 @@
         if (voiceSelect) voiceSelect.value = data.defaultVoice;
       }
       if (data.defaultSpeed) {
-        // Snap any saved value (legacy or current) to the nearest 0.1 detent.
-        const saved = parseFloat(data.defaultSpeed);
-        if (Number.isFinite(saved)) {
-          const idx = nearestSpeedIndex(saved);
-          menuPanelEl.querySelector('.hltr-speed-slider').value = idx;
-          menuPanelEl.querySelector('.hltr-speed-label').textContent = formatSpeedLabel(SPEEDS[idx]);
-        }
+        const speed = snapSpeed(data.defaultSpeed);
+        menuPanelEl.querySelector('.hltr-speed-slider').value = speed;
+        menuPanelEl.querySelector('.hltr-speed-label').textContent = formatSpeedLabel(speed);
       }
     });
 
@@ -742,7 +736,7 @@
     const slider = menuPanelEl.querySelector('.hltr-speed-slider');
     const speedLbl = menuPanelEl.querySelector('.hltr-speed-label');
     slider.addEventListener('input', () => {
-      const speed = SPEEDS[parseInt(slider.value)];
+      const speed = snapSpeed(slider.value);
       const changed = speed !== cachedSpeed;
       if (changed) invalidateAudioCache('speed-changed');
       cachedSpeed = speed;
@@ -1033,9 +1027,7 @@
 
   function currentSpeedForPlayback() {
     const slider = menuPanelEl ? menuPanelEl.querySelector('.hltr-speed-slider') : null;
-    if (!slider) return cachedSpeed;
-    const idx = parseInt(slider.value, 10);
-    return SPEEDS[idx] ?? cachedSpeed;
+    return slider ? snapSpeed(slider.value) : cachedSpeed;
   }
 
   function prefetchSentence(idx, voice, speed) {
@@ -1702,18 +1694,17 @@
     }
   }
 
-  function nearestSpeedIndex(speed) {
-    const clamped = Math.max(SPEEDS[0], Math.min(SPEEDS[SPEEDS.length - 1], speed));
-    let bestIdx = SPEED_DEFAULT_INDEX;
-    let bestDelta = Infinity;
-    for (let i = 0; i < SPEEDS.length; i++) {
-      const d = Math.abs(SPEEDS[i] - clamped);
-      if (d < bestDelta) { bestDelta = d; bestIdx = i; }
-    }
-    return bestIdx;
+  // Snap to one decimal in [SPEED_MIN, SPEED_MAX] so storage stays clean even
+  // if the range input reports float drift (e.g. 0.7000000000000001).
+  // Default is 1.2 (not 1.0, unlike the popup's snapSpeed) to match cachedSpeed.
+  function snapSpeed(value) {
+    const raw = parseFloat(value);
+    const safe = Number.isFinite(raw) ? raw : 1.2;
+    const clamped = Math.max(SPEED_MIN, Math.min(SPEED_MAX, safe));
+    return Math.round(clamped * 10) / 10;
   }
 
-  // SPEEDS are all single-decimal steps (0.5x, 0.6x, ... 2.0x).
+  // Speeds are all single-decimal steps (0.5x, 0.6x, ... 2.0x).
   function formatSpeedLabel(speed) {
     return speed.toFixed(1) + 'x';
   }
