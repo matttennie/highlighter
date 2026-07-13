@@ -73,6 +73,26 @@ the next request). It requires the Kokoro model files at
 missing. Once installed, the extension detects and uses the server
 automatically — no configuration needed.
 
+#### Troubleshooting: “libespeak-ng.dylib” Not Opened popup (macOS)
+
+The `espeakng_loader` pip wheel ships an unsigned `libespeak-ng.dylib`,
+and `phonemizer` loads a fresh temp-dir *copy* of it on every model load.
+macOS Gatekeeper records popup denials by content hash (cdhash), so once
+the popup is dismissed, every identical copy stays blocked and the popup
+recurs forever. Fix — re-sign with a **new identifier** (a plain re-sign
+keeps the denied hash) and restart the server:
+
+```bash
+codesign --force --sign - --identifier highlighter-espeak-$(date +%s) \
+  <venv>/lib/python*/site-packages/espeakng_loader/libespeak-ng*.dylib
+pkill -f kokoro_server.py   # a running server keeps failing until restarted
+```
+
+Apply to whichever venv the server runs from (`server/.venv` and/or
+`~/Library/Application Support/HighlighterTTS/.venv`). Must be re-run
+after any venv rebuild or `espeakng_loader` reinstall. TODO: fold this
+into `server/install.sh` as an install step before shipping to end users.
+
 ## Usage
 
 - Toggle highlight mode from the extension context menu or `Alt+H`
