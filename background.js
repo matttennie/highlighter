@@ -21,11 +21,25 @@ const NATIVE_HEALTH_TIMEOUT_MS = 600;
 const NATIVE_TTS_TIMEOUT_MS = 30000;
 const NATIVE_RECHECK_MS = 30000;
 
+// Native-messaging lifecycle host (server/native_host.py). Opening this port
+// makes Chrome spawn the host, which boots kokoro_server.py; the host reaps
+// the server when the port closes (Chrome quit / extension disabled / SW
+// death). An active native port also keeps the MV3 service worker alive on
+// Chrome 116+ — so the server lives exactly as long as Chrome does, from the
+// user's first engagement.
+const NATIVE_HOST = 'com.highlighter.kokoro';
+const LEASH_PING_MS = 25000;
+const LEASH_UNAVAILABLE_BACKOFF_MS = 5 * 60 * 1000;
+
 let requestSeq = 0;
 let debugLogBuffer = [];
 let isFlushPending = false;
 let offscreenCreating = null;
 let nativeState = { available: null, checkedAt: 0 };
+let nativePort = null;
+let leashState = 'closed'; // 'closed' | 'opening' | 'open' | 'unavailable'
+let leashPingInterval = null;
+let leashUnavailableAt = 0;
 
 function getStoredDefaultVoice() {
   return new Promise((resolve) => {
@@ -256,6 +270,79 @@ function markNativeDown() {
   nativeState = { available: false, checkedAt: Date.now() };
 }
 
+// Open the native-messaging leash on user engagement. Idempotent via
+// leashState: a no-op while 'opening' or 'open'. When 'unavailable' (host not
+// installed), re-probe at most once per LEASH_UNAVAILABLE_BACKOFF_MS — the
+// user may install the host later, but we never hot-loop connectNative.
+function openLeash() {
+  if (leashState === 'open' || leashState === 'opening') return;
+  // A live port already leashes us (e.g. server-status ok:false left the port
+  // open in 'unavailable'). Never open a second one — that would spawn a
+  // duplicate host. Reconnect only after onDisconnect nulls the port.
+  if (nativePort) return;
+  if (leashState === 'unavailable' && Date.now() - leashUnavailableAt < LEASH_UNAVAILABLE_BACKOFF_MS) return;
+
+  leashState = 'opening';
+  try {
+    nativePort = chrome.runtime.connectNative(NATIVE_HOST);
+  } catch (err) {
+    // Thrown when the permission is missing or the host name is invalid.
+    nativePort = null;
+    leashState = 'unavailable';
+    leashUnavailableAt = Date.now();
+    logDebug('native-leash-connect-threw', { error: err?.message || String(err) });
+    return;
+  }
+
+  nativePort.onMessage.addListener((msg) => {
+    if (!msg || msg.type !== 'server-status') return;
+    if (msg.ok) {
+      leashState = 'open';
+      // Force availability now — the health probe would otherwise race the
+      // server boot on a cold start; the host says the server is up, trust it.
+      nativeState = { available: true, checkedAt: Date.now() };
+      logDebug('native-leash-ready', { owned: Boolean(msg.owned) });
+    } else {
+      // Host is up but the server failed to boot — treat as unavailable so the
+      // WASM path carries requests. Keep the port open (it still pins the SW,
+      // and the live-port guard in openLeash blocks a duplicate host).
+      leashState = 'unavailable';
+      leashUnavailableAt = Date.now();
+      markNativeDown();
+      logDebug('native-leash-server-down', {});
+    }
+  });
+
+  nativePort.onDisconnect.addListener(() => {
+    const error = chrome.runtime.lastError?.message || null;
+    // If we never reached 'open', the host isn't installed/reachable → back
+    // off. If we HAD opened (Chrome killed the host), allow a reopen on the
+    // next engagement rather than parking in 'unavailable'.
+    const hadOpened = leashState === 'open';
+    leashState = hadOpened ? 'closed' : 'unavailable';
+    if (!hadOpened) leashUnavailableAt = Date.now();
+    nativePort = null;
+    if (leashPingInterval !== null) {
+      clearInterval(leashPingInterval);
+      leashPingInterval = null;
+    }
+    markNativeDown();
+    logDebug('native-leash-disconnect', { error, hadOpened });
+  });
+
+  // An active native port keeps the MV3 service worker alive on Chrome 116+.
+  // The 25s ping both exercises the host's pong path and refreshes that
+  // keepalive (well under Chrome's 30s idle SW timeout).
+  if (leashPingInterval !== null) clearInterval(leashPingInterval);
+  leashPingInterval = setInterval(() => {
+    try {
+      nativePort?.postMessage({ type: 'ping' });
+    } catch {
+      // Port died between disconnect and clear — the onDisconnect handler cleans up.
+    }
+  }, LEASH_PING_MS);
+}
+
 // ── Offscreen document management ───────────────────────────────────
 // The Kokoro model runs in an offscreen document (service workers can't
 // use WASM threads/WebGPU or keep the model warm). Created lazily on the
@@ -281,6 +368,13 @@ async function ensureOffscreenDocument() {
 // server is up we deliberately skip loading the ~300MB WASM model at all —
 // that's the whole RAM win of having a native companion server.
 async function preWarmEngine() {
+  // Open the leash first: on a cold start this is what makes Chrome spawn the
+  // host and boot the server. isNativeAvailable() below may still race the
+  // boot (up to ~20s on first-ever model load); if so we create the offscreen
+  // doc as today, and once server-status:ok lands the next request goes
+  // native. When server-status arrives before this health check, openLeash's
+  // onMessage has already forced nativeState available, so we skip WASM.
+  openLeash();
   if (await isNativeAvailable()) return;
   await ensureOffscreenDocument();
 }
@@ -461,6 +555,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // ── TTS request handler ─────────────────────────────────────────────
 async function handleTtsRequest({ text, voice, speed }, requestId = ++requestSeq, clientRequestId) {
+  openLeash();
   const startedAt = performance.now();
 
   const normalizedText = typeof text === 'string' ? text.trim() : '';
@@ -542,6 +637,7 @@ async function handleTtsRequest({ text, voice, speed }, requestId = ++requestSeq
 
 // ── Voices request handler ──────────────────────────────────────────
 async function handleVoicesRequest(requestId = ++requestSeq) {
+  openLeash();
   logDebug('voices-request-forwarded', { requestId });
 
   if (await isNativeAvailable()) {
@@ -574,6 +670,7 @@ async function handleVoicesRequest(requestId = ++requestSeq) {
 
 // ── Engine status handler ───────────────────────────────────────────
 async function handleEngineStatusRequest() {
+  openLeash();
   if (await isNativeAvailable()) {
     return { ok: true, status: 'ready', backend: 'native', progress: 100, warm: true };
   }

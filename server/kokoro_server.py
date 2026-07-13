@@ -26,17 +26,16 @@ Endpoints (JSON in, JSON out):
 Model lifecycle: lazy-loaded on first /voices or /tts request (guarded by
 a lock so concurrent requests only load once), with an immediate warmup
 inference to pay ONNX Runtime's first-call cost up front instead of during
-a real request. A background thread unloads the model (frees the
-kokoro-onnx session, drops the reference, garbage-collects) after
-MODEL_IDLE_UNLOAD_SECONDS (15 minutes) with no synthesis activity — the
-HTTP listener itself is never torn down, so the next request just pays a
-cold-load again. Synthesis is serialized behind a single lock: kokoro-onnx
+a real request. A background thread EXITS the whole process after
+SERVER_IDLE_EXIT_SECONDS (15 minutes) with no synthesis activity. The
+Chrome native host that spawned us is watching this child, so our exit
+drops the extension's native port; Chrome respawns a fresh host+server on
+the next engagement. Synthesis is serialized behind a single lock: kokoro-onnx
 runs one inference at a time faster than two interleaved ones fight over
 the same session.
 """
 
 import base64
-import gc
 import io
 import json
 import os
@@ -76,9 +75,11 @@ ALLOWED_ORIGIN_PREFIX = "chrome-extension://"
 # Reject POST bodies larger than this without reading them.
 MAX_BODY_BYTES = 64 * 1024
 
-# Unload the model after 15 minutes with no synthesis requests. The HTTP
-# listener stays up; the next request after this just pays a cold load.
-MODEL_IDLE_UNLOAD_SECONDS = 15 * 60
+# Exit the whole process after 15 minutes with no synthesis requests. Boot
+# counts as activity (see main), so an engaged-but-unused server still exits
+# on schedule. The native host watching this child then exits too, dropping
+# the extension's native port; the next engagement respawns a fresh server.
+SERVER_IDLE_EXIT_SECONDS = 15 * 60
 IDLE_CHECK_INTERVAL_SECONDS = 30
 
 # voice-id prefix -> (display category, kokoro-onnx `lang` code for create())
@@ -161,26 +162,20 @@ def _mark_activity():
     _last_activity = time.time()
 
 
-def _unload_if_idle():
-    global _kokoro, _last_activity
-    with _load_lock:
-        if _kokoro is not None and _last_activity is not None:
-            idle_for = time.time() - _last_activity
-            if idle_for > MODEL_IDLE_UNLOAD_SECONDS:
-                print("kokoro_server: unloading model after %.0fs idle" % idle_for,
-                      file=sys.stderr, flush=True)
-                _kokoro = None
-                gc.collect()
-
-
-def _idle_unload_loop():
+def _idle_exit_loop(server):
+    """Shut the server down after SERVER_IDLE_EXIT_SECONDS with no activity.
+    server.shutdown() unblocks serve_forever() in main(), which then flushes
+    and exits 0 — a clean full-process exit, not just a model unload."""
     while True:
         time.sleep(IDLE_CHECK_INTERVAL_SECONDS)
-        try:
-            _unload_if_idle()
-        except Exception as e:
-            print("kokoro_server: idle-unload check failed: %s" % e,
+        if _last_activity is None:
+            continue
+        idle_for = time.time() - _last_activity
+        if idle_for > SERVER_IDLE_EXIT_SECONDS:
+            print("kokoro_server: exiting after %.0fs idle" % idle_for,
                   file=sys.stderr, flush=True)
+            server.shutdown()  # unblocks serve_forever(); main() exits 0
+            return
 
 
 def model_is_loaded():
@@ -360,18 +355,23 @@ class KokoroHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    unloader = threading.Thread(target=_idle_unload_loop, daemon=True)
-    unloader.start()
-
+    global _last_activity
     server = ThreadingHTTPServer((HOST, PORT), KokoroHandler)
+    _last_activity = time.time()  # boot counts as activity; idle clock starts now
+    idler = threading.Thread(target=_idle_exit_loop, args=(server,), daemon=True)
+    idler.start()
+
     print("kokoro_server: listening on http://%s:%d" % (HOST, PORT),
           file=sys.stderr, flush=True)
     try:
-        server.serve_forever()
+        server.serve_forever()  # returns when _idle_exit_loop calls shutdown()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+    sys.stderr.flush()
+    sys.stdout.flush()
+    sys.exit(0)  # full-process exit — the native host reaps on our departure
 
 
 if __name__ == "__main__":

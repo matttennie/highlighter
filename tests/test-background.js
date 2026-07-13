@@ -202,3 +202,59 @@ describe('native-first routing', () => {
     assert.match(backgroundJs, /native synths are ~1\.5s/i);
   });
 });
+
+describe('native-messaging server leash', () => {
+  it('names the host and leash timing constants', () => {
+    assert.match(backgroundJs, /const NATIVE_HOST\s*=\s*'com\.highlighter\.kokoro'/);
+    assert.match(backgroundJs, /const LEASH_PING_MS\s*=\s*25000/);
+    assert.match(backgroundJs, /const LEASH_UNAVAILABLE_BACKOFF_MS\s*=\s*5\s*\*\s*60\s*\*\s*1000/);
+  });
+
+  it('declares the leash state machine', () => {
+    assert.match(backgroundJs, /let nativePort\s*=\s*null/);
+    assert.match(backgroundJs, /let leashState\s*=\s*'closed'/);
+    assert.match(backgroundJs, /let leashPingInterval\s*=\s*null/);
+    assert.match(backgroundJs, /let leashUnavailableAt\s*=\s*0/);
+  });
+
+  it('openLeash is idempotent and never opens a second port', () => {
+    const fn = backgroundJs.match(/function openLeash\(\)[\s\S]*?\n}\n/);
+    assert.ok(fn, 'openLeash not found');
+    // no-op while already opening/open, and never a duplicate when a port lives
+    assert.match(fn[0], /if \(leashState === 'open' \|\| leashState === 'opening'\) return/);
+    assert.match(fn[0], /if \(nativePort\) return/);
+    // backoff while unavailable
+    assert.match(fn[0], /leashState === 'unavailable' && Date\.now\(\) - leashUnavailableAt < LEASH_UNAVAILABLE_BACKOFF_MS/);
+    // spawns the host via connectNative
+    assert.match(fn[0], /chrome\.runtime\.connectNative\(NATIVE_HOST\)/);
+  });
+
+  it('server-status ok forces native availability; not-ok backs off to WASM', () => {
+    const fn = backgroundJs.match(/function openLeash\(\)[\s\S]*?\n}\n/);
+    assert.match(fn[0], /msg\.type !== 'server-status'/);
+    assert.match(fn[0], /nativeState = \{ available: true, checkedAt: Date\.now\(\) \}/);
+    assert.match(fn[0], /markNativeDown\(\)/);
+  });
+
+  it('onDisconnect marks native down and reopens only if it had opened', () => {
+    const fn = backgroundJs.match(/function openLeash\(\)[\s\S]*?\n}\n/);
+    assert.match(fn[0], /onDisconnect\.addListener/);
+    assert.match(fn[0], /const hadOpened = leashState === 'open'/);
+    assert.match(fn[0], /leashState = hadOpened \? 'closed' : 'unavailable'/);
+    assert.match(fn[0], /nativePort = null/);
+    assert.match(fn[0], /clearInterval\(leashPingInterval\)/);
+  });
+
+  it('keeps the SW alive with a 25s ping under the native port', () => {
+    const fn = backgroundJs.match(/function openLeash\(\)[\s\S]*?\n}\n/);
+    assert.match(fn[0], /setInterval\(\(\)\s*=>\s*\{[\s\S]*?nativePort\?\.postMessage\(\{ type: 'ping' \}\)[\s\S]*?\},\s*LEASH_PING_MS\)/);
+  });
+
+  it('opens the leash on every engagement path', () => {
+    for (const name of ['preWarmEngine', 'handleTtsRequest', 'handleVoicesRequest', 'handleEngineStatusRequest']) {
+      const fn = backgroundJs.match(new RegExp(`async function ${name}\\([^)]*\\)\\s*\\{[\\s\\S]*?\\n}\\n`));
+      assert.ok(fn, `${name} not found`);
+      assert.match(fn[0], /openLeash\(\)/, `${name} must openLeash`);
+    }
+  });
+});

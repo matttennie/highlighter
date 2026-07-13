@@ -5,7 +5,7 @@
  * assertions read the server source and check it declares the behavior
  * specified for the local HTTP companion: binds to loopback only, exposes
  * the three endpoints with the right defaults/clamps, sends CORS headers,
- * and unloads the idle model after 15 minutes.
+ * and EXITS the whole process after 15 minutes idle (Chrome-owned lifecycle).
  *
  * The server was manually smoke-tested (curl against a running instance)
  * as part of building this file; see .superpowers/native-server-report.md.
@@ -149,10 +149,17 @@ describe('server/kokoro_server.py', () => {
     assert.match(source, /self\._send_json\(400,\s*\{"error":\s*"bad-request"\}\)/);
   });
 
-  it('unloads the idle model after 15 minutes with a background thread', () => {
-    assert.match(source, /MODEL_IDLE_UNLOAD_SECONDS\s*=\s*15\s*\*\s*60/);
-    assert.match(source, /gc\.collect\(\)/);
-    assert.match(source, /threading\.Thread\(target=_idle_unload_loop,\s*daemon=True\)/);
+  it('EXITS the whole process (not just unloads the model) after 15 minutes idle', () => {
+    assert.match(source, /SERVER_IDLE_EXIT_SECONDS\s*=\s*15\s*\*\s*60/);
+    // A background thread watches for idleness and shuts the server down; main
+    // then flushes and exits 0. This is a full process exit, not a model unload.
+    assert.match(source, /threading\.Thread\(target=_idle_exit_loop,\s*args=\(server,\),\s*daemon=True\)/);
+    assert.match(source, /idle_for\s*>\s*SERVER_IDLE_EXIT_SECONDS/);
+    assert.match(source, /server\.shutdown\(\)/);
+    assert.match(source, /sys\.exit\(0\)/);
+    // The old model-unload-in-place behavior is gone.
+    assert.doesNotMatch(source, /MODEL_IDLE_UNLOAD_SECONDS/);
+    assert.doesNotMatch(source, /_idle_unload_loop/);
   });
 
   it('serializes synthesis behind a single inference lock', () => {

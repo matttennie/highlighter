@@ -4,6 +4,7 @@
   "version": "0.2.0",
   "description": "Select text with a paint-brush stroke and hear it read aloud with private, on-device Kokoro AI voices",
   "minimum_chrome_version": "116",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA0cnGDbD6hTs8s8d13JDM5wGOA76o9438wdc3yF9U0rK9Q5HAUhDk6L9Z2EKvmOFQ3kozZMciEXeu7ZgBmTAySPEOSpMW79U1X9dP4BJ7chscNxiwmu8fi0LFKdh5xM6foAvnaj4tjGJILmTHjfZryJXTBYrOR3sIx3ZFgGhe0pwqQDEGJklSML25CrhwTrNAYE8Xjky7U5pb7r03MMS87ZMVtENg9jXqSLtYN9Eu62jMRzkxwxzvvZXCWJlrj6RmeRcHb4E88gCd4G/0hjFoJy03xIVqq47YelEM8GH5kJRHQJY9BP3Bhozz2R08yZll5yx2HOxXNzCEbuS2/devgQIDAQAB",
   "host_permissions": ["http://127.0.0.1/*"],
   "permissions": [
     "activeTab",
@@ -11,7 +12,8 @@
     "contextMenus",
     "scripting",
     "offscreen",
-    "unlimitedStorage"
+    "unlimitedStorage",
+    "nativeMessaging"
   ],
   "background": {
     "service_worker": "background.js"
