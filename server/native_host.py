@@ -33,6 +33,14 @@ ERR_LOG = "/tmp/highlighter-kokoro.err"
 HEALTH_TIMEOUT_S = 20
 REAP_GRACE_S = 5
 
+SESSIONS_DIR = os.environ.get(
+    "KOKORO_SESSIONS_DIR",
+    os.path.join(os.path.expanduser("~"), ".cache", "kokoro", "sessions"))
+SHARED_TTS_DIR = os.environ.get(
+    "KOKORO_SHARED_TTS_DIR",
+    os.path.join(os.path.expanduser("~"), ".claude", "skills", "tts"))
+MARKER_PATH = os.path.join(SESSIONS_DIR, "chrome-%d" % os.getpid())
+
 # Guards the single shutdown path so the stdin-EOF/SIGTERM reap and the
 # child-watch exit never both fire: whichever wins flips _shutting_down; the
 # other backs off. Prevents a double-reap / racing exit.
@@ -68,6 +76,24 @@ def send_message(obj):
     sys.stdout.buffer.write(LEN_STRUCT.pack(len(data)))
     sys.stdout.buffer.write(data)
     sys.stdout.buffer.flush()
+
+
+def write_marker():
+    """Leash marker: tells the shared server Chrome is a live consumer.
+    Best-effort — a failed write only costs warmth precision, and a leaked
+    marker is bounded by the server's claim window."""
+    try:
+        os.makedirs(SESSIONS_DIR, exist_ok=True)
+        open(MARKER_PATH, "w").close()
+    except OSError:
+        pass
+
+
+def remove_marker():
+    try:
+        os.unlink(MARKER_PATH)
+    except OSError:
+        pass
 
 
 # --- Server lifecycle ----------------------------------------------------
@@ -114,23 +140,27 @@ def start_server(port):
         return False, None, True  # external server; not ours to reap
 
     here = os.path.dirname(os.path.abspath(__file__))
-    server_py = os.path.join(here, "kokoro_server.py")
+    shared_py = os.path.join(SHARED_TTS_DIR, ".venv", "bin", "python3")
+    shared_srv = os.path.join(SHARED_TTS_DIR, "kokoro_server.py")
+    shared = os.path.exists(shared_py) and os.path.exists(shared_srv)
+    if shared:
+        cmd = [shared_py, shared_srv]
+    else:
+        cmd = [sys.executable, os.path.join(here, "kokoro_server.py")]
     errlog = open(ERR_LOG, "ab")
-    # Same interpreter that runs this host (the venv python the manifest
-    # points at). Child inherits our env, so KOKORO_HTTP_PORT propagates.
-    # start_new_session left False (default) keeps the child in our process
-    # group so it dies with us on a normal terminal hangup.
-    # ponytail: if the host is SIGKILL'd (not SIGTERM/EOF), the child
-    #   survives orphaned — no parent-death signal on macOS. The EOF and
-    #   SIGTERM paths are the normal ones and both reap the child; upgrade
-    #   path if that ceiling ever bites is a pidfile the next host cleans up.
+    # Shared server: it manages its own lifetime via warmth claims, so we
+    # detach it (start_new_session) and never own/reap it. Bundled fallback
+    # keeps the old owned/reaped semantics.
     child = subprocess.Popen(
-        [sys.executable, server_py],
+        cmd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=errlog,
+        start_new_session=shared,
     )
     ok = wait_for_health(port)
+    if shared:
+        return False, None, ok  # not ours to watch or reap
     return True, child, ok
 
 
@@ -172,6 +202,7 @@ def _watch_child(child):
     # Child is already dead, so there is nothing to reap; a hard exit here just
     # closes stdout -> the extension sees onDisconnect. os._exit skips the
     # finally block, which is fine precisely because the child is gone.
+    remove_marker()
     sys.stderr.flush()
     os._exit(0)
 
@@ -182,6 +213,7 @@ def main():
     owned = False
     child = None
     try:
+        write_marker()
         owned, child, ok = start_server(PORT)
         send_message({"type": "server-status", "ok": ok, "owned": owned, "port": PORT})
 
@@ -199,6 +231,7 @@ def main():
                 send_message({"type": "pong"})
             # ignore every other message type
     finally:
+        remove_marker()
         # Claim the shutdown so the child-watch thread backs off instead of
         # racing an os._exit against our reap.
         global _shutting_down
