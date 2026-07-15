@@ -96,7 +96,11 @@ def main():
     marker2 = "chrome-%d" % host2.pid
     assert marker2 in os.listdir(SESSIONS), "leash marker missing (respawn)"
 
-    subprocess.run(["pkill", "-f", SHARED_SRV_PATH])
+    pids = subprocess.run(["lsof", "-ti", "tcp:%d" % PORT],
+                          capture_output=True, text=True).stdout.split()
+    assert pids, "no process listening on test port to kill"
+    for pid in pids:
+        subprocess.run(["kill", pid])
     host2.wait(timeout=10)
     assert marker2 not in os.listdir(SESSIONS), \
         "leash marker not dropped after shared server died"
