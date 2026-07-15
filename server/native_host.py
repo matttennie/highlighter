@@ -32,6 +32,7 @@ HOST = "127.0.0.1"
 ERR_LOG = "/tmp/highlighter-kokoro.err"
 HEALTH_TIMEOUT_S = 20
 REAP_GRACE_S = 5
+PORT_WATCH_INTERVAL_S = float(os.environ.get("KOKORO_PORT_WATCH_INTERVAL", "15"))
 
 SESSIONS_DIR = os.environ.get(
     "KOKORO_SESSIONS_DIR",
@@ -129,7 +130,8 @@ def start_server(port):
     """Ensure a Kokoro HTTP server exists on `port`.
 
     Returns (owned, child, ok):
-      owned  - True only if WE spawned it (and therefore must reap it).
+      owned  - True only for the bundled fallback we must watch and reap;
+               the shared server is spawned detached and never owned.
       child  - the Popen handle when owned, else None.
       ok     - True if /health is answering.
 
@@ -207,6 +209,24 @@ def _watch_child(child):
     os._exit(0)
 
 
+def _watch_port():
+    """Shared/external server (not owned): when it exits — claims expired,
+    manual kill — drop the leash so Chrome respawns host+server on the next
+    engagement. Mirrors _watch_child for the owned case."""
+    global _shutting_down
+    while True:
+        time.sleep(PORT_WATCH_INTERVAL_S)
+        if port_is_listening(PORT):
+            continue
+        with _shutdown_lock:
+            if _shutting_down:
+                return
+            _shutting_down = True
+        remove_marker()
+        sys.stderr.flush()
+        os._exit(0)
+
+
 def main():
     signal.signal(signal.SIGTERM, _on_sigterm)
 
@@ -220,6 +240,8 @@ def main():
         # Watch the server we own: if it self-exits on idle, we must exit too.
         if owned and child is not None:
             threading.Thread(target=_watch_child, args=(child,), daemon=True).start()
+        elif ok:
+            threading.Thread(target=_watch_port, daemon=True).start()
 
         # Block reading stdin. The read loop IS the leash: it returns None
         # the moment Chrome closes the port, and the finally-block reaps.
