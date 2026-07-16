@@ -13,9 +13,40 @@ const OFFSCREEN_URL = 'offscreen/offscreen.html';
 const OFFSCREEN_SEND_RETRIES = 5;
 const OFFSCREEN_SEND_RETRY_DELAY_MS = 200;
 
+// Kokoro v1 voice metadata is static. Serving it here keeps both voice
+// selectors useful without booting the native server or the ~300MB WASM
+// engine merely to enumerate ids. Availability is still validated naturally
+// when the user requests synthesis.
+const VOICE_GROUPS = [
+  ['English (US)', [
+    'af_alloy', 'af_aoede', 'af_bella', 'af_heart', 'af_jessica', 'af_kore',
+    'af_nicole', 'af_nova', 'af_river', 'af_sarah', 'af_sky', 'am_adam',
+    'am_echo', 'am_eric', 'am_fenrir', 'am_liam', 'am_michael', 'am_onyx',
+    'am_puck', 'am_santa',
+  ]],
+  ['English (UK)', [
+    'bf_alice', 'bf_emma', 'bf_isabella', 'bf_lily',
+    'bm_daniel', 'bm_fable', 'bm_george', 'bm_lewis',
+  ]],
+  ['Spanish', ['ef_dora', 'em_alex', 'em_santa']],
+  ['French', ['ff_siwis']],
+  ['Hindi', ['hf_alpha', 'hf_beta', 'hm_omega', 'hm_psi']],
+  ['Italian', ['if_sara', 'im_nicola']],
+  ['Japanese', ['jf_alpha', 'jf_gongitsune', 'jf_nezumi', 'jf_tebukuro', 'jm_kumo']],
+  ['Portuguese (BR)', ['pf_dora', 'pm_alex', 'pm_santa']],
+  ['Chinese', [
+    'zf_xiaobei', 'zf_xiaoni', 'zf_xiaoxiao', 'zf_xiaoyi',
+    'zm_yunjian', 'zm_yunxi', 'zm_yunxia', 'zm_yunyang',
+  ]],
+];
+const VOICE_CATALOG = VOICE_GROUPS.flatMap(([category, voiceIds]) =>
+  voiceIds.map((voiceId) => ({ voiceId, name: voiceId, category }))
+);
+
 // Native companion server (server/kokoro_server.py) — loopback only, checked
-// first on every TTS/voices/status request. Falls back to the in-extension
-// WASM engine (offscreen document) whenever it's unavailable.
+// first on every TTS or waking status request. Opening the toolbar popup sends
+// a native-only wake so this process can boot ahead of first playback without
+// also loading the much heavier in-extension WASM fallback.
 const NATIVE_BASE_URL = 'http://127.0.0.1:8880';
 const NATIVE_HEALTH_TIMEOUT_MS = 600;
 const NATIVE_TTS_TIMEOUT_MS = 30000;
@@ -185,9 +216,6 @@ function injectContentScript(tabId, callback, url = '') {
 }
 
 function sendToggle(tabId, url = '', retrying = false, done = () => {}) {
-  // The user is engaging — start warming the voice engine now so the first
-  // sentence doesn't wait for model load.
-  void preWarmEngine().catch(() => {});
   if (!Number.isInteger(tabId)) {
     done({ ok: false, error: 'tab-not-found' });
     return;
@@ -270,19 +298,25 @@ function markNativeDown() {
   nativeState = { available: false, checkedAt: Date.now() };
 }
 
+function markNativeUnknown() {
+  nativeState = { available: null, checkedAt: 0 };
+}
+
 // Open the native-messaging leash on user engagement. Idempotent via
 // leashState: a no-op while 'opening' or 'open'. When 'unavailable' (host not
 // installed), re-probe at most once per LEASH_UNAVAILABLE_BACKOFF_MS — the
-// user may install the host later, but we never hot-loop connectNative.
-function openLeash() {
+// user may install the host later, but we never hot-loop connectNative. A new
+// toolbar-popup engagement may explicitly bypass that backoff once.
+function openLeash(retryUnavailable = false) {
   if (leashState === 'open' || leashState === 'opening') return;
-  // A live port already leashes us (e.g. server-status ok:false left the port
-  // open in 'unavailable'). Never open a second one — that would spawn a
-  // duplicate host. Reconnect only after onDisconnect nulls the port.
+  // A live port already leashes us. Never open a second one — that would
+  // spawn a duplicate host. Reconnect only after onDisconnect nulls the port.
   if (nativePort) return;
-  if (leashState === 'unavailable' && Date.now() - leashUnavailableAt < LEASH_UNAVAILABLE_BACKOFF_MS) return;
+  if (!retryUnavailable && leashState === 'unavailable' &&
+      Date.now() - leashUnavailableAt < LEASH_UNAVAILABLE_BACKOFF_MS) return;
 
   leashState = 'opening';
+  logDebug('native-leash-opening', { retryUnavailable });
   try {
     nativePort = chrome.runtime.connectNative(NATIVE_HOST);
   } catch (err) {
@@ -290,6 +324,9 @@ function openLeash() {
     nativePort = null;
     leashState = 'unavailable';
     leashUnavailableAt = Date.now();
+    // A missing lifecycle host does not prove that a manually started/shared
+    // HTTP server is absent. Leave one direct health probe available.
+    markNativeUnknown();
     logDebug('native-leash-connect-threw', { error: err?.message || String(err) });
     return;
   }
@@ -303,13 +340,14 @@ function openLeash() {
       nativeState = { available: true, checkedAt: Date.now() };
       logDebug('native-leash-ready', { owned: Boolean(msg.owned) });
     } else {
-      // Host is up but the server failed to boot — treat as unavailable so the
-      // WASM path carries requests. Keep the port open (it still pins the SW,
-      // and the live-port guard in openLeash blocks a duplicate host).
+      // Host is up but the server failed to boot — treat it as unavailable so
+      // the WASM path carries requests. Drop this failed leash so a later,
+      // explicit toolbar selection can retry after the user fixes the cause.
       leashState = 'unavailable';
       leashUnavailableAt = Date.now();
       markNativeDown();
       logDebug('native-leash-server-down', {});
+      nativePort?.disconnect();
     }
   });
 
@@ -326,7 +364,14 @@ function openLeash() {
       clearInterval(leashPingInterval);
       leashPingInterval = null;
     }
-    markNativeDown();
+    if (hadOpened) {
+      markNativeDown();
+    } else {
+      // Failure to connect to the lifecycle host says nothing conclusive about
+      // an independently running loopback server. The next status/TTS request
+      // gets one real health probe instead of inheriting a false negative.
+      markNativeUnknown();
+    }
     logDebug('native-leash-disconnect', { error, hadOpened });
   });
 
@@ -346,7 +391,8 @@ function openLeash() {
 // ── Offscreen document management ───────────────────────────────────
 // The Kokoro model runs in an offscreen document (service workers can't
 // use WASM threads/WebGPU or keep the model warm). Created lazily on the
-// first TTS/voices/status request and kept alive to hold the model.
+// first TTS request (or an explicit waking status request) and kept alive to
+// hold the model. Voice metadata is served from VOICE_CATALOG above.
 async function ensureOffscreenDocument() {
   const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
   if (contexts.length > 0) return;
@@ -362,21 +408,6 @@ async function ensureOffscreenDocument() {
       });
   }
   await offscreenCreating;
-}
-
-// Fire-and-forget warmup on user engagement (sendToggle). When the native
-// server is up we deliberately skip loading the ~300MB WASM model at all —
-// that's the whole RAM win of having a native companion server.
-async function preWarmEngine() {
-  // Open the leash first: on a cold start this is what makes Chrome spawn the
-  // host and boot the server. isNativeAvailable() below may still race the
-  // boot (up to ~20s on first-ever model load); if so we create the offscreen
-  // doc as today, and once server-status:ok lands the next request goes
-  // native. When server-status arrives before this health check, openLeash's
-  // onMessage has already forced nativeState available, so we skip WASM.
-  openLeash();
-  if (await isNativeAvailable()) return;
-  await ensureOffscreenDocument();
 }
 
 function sendToOffscreenOnce(message) {
@@ -493,7 +524,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.type === 'engine-status-request') {
-    handleEngineStatusRequest()
+    handleEngineStatusRequest({
+      wake: msg.wake !== false,
+      nativeOnly: msg.nativeOnly === true,
+      retryNative: msg.retryNative === true,
+    })
       .then(sendResponse)
       .catch((err) => sendResponse({ ok: false, error: 'engine-error', detail: err.message }));
     return true;
@@ -637,40 +672,58 @@ async function handleTtsRequest({ text, voice, speed }, requestId = ++requestSeq
 
 // ── Voices request handler ──────────────────────────────────────────
 async function handleVoicesRequest(requestId = ++requestSeq) {
-  openLeash();
-  logDebug('voices-request-forwarded', { requestId });
-
-  if (await isNativeAvailable()) {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), NATIVE_TTS_TIMEOUT_MS);
-      let res;
-      try {
-        res = await fetch(`${NATIVE_BASE_URL}/voices`, { signal: controller.signal });
-      } finally {
-        clearTimeout(timer);
-      }
-      if (!res.ok) throw new Error(`native-http-${res.status}`);
-      const payload = await res.json();
-      if (!payload || !Array.isArray(payload.voices)) throw new Error('native-bad-payload');
-      logDebug('voices-parsed', { requestId, ok: true, count: payload.voices.length });
-      return { ok: true, voices: payload.voices };
-    } catch (err) {
-      markNativeDown();
-      logDebug('native-voices-failed', { detail: err.message });
-      // Fall through to the offscreen (WASM) path below.
-    }
-  }
-
-  await ensureOffscreenDocument();
-  const response = (await sendToOffscreen({ type: 'voices-request' })) || { ok: false, error: 'no-response' };
-  logDebug('voices-parsed', { requestId, ok: Boolean(response.ok), count: response.voices?.length || 0 });
-  return response;
+  logDebug('voices-catalog-served', { requestId, count: VOICE_CATALOG.length });
+  return { ok: true, voices: VOICE_CATALOG };
 }
 
 // ── Engine status handler ───────────────────────────────────────────
-async function handleEngineStatusRequest() {
-  openLeash();
+async function handleEngineStatusRequest({
+  wake = true,
+  nativeOnly = false,
+  retryNative = false,
+} = {}) {
+  // A non-waking status peek may inspect either backend if it already exists,
+  // but it never starts one.
+  if (!wake) {
+    const nativeReady = nativeState.available === true &&
+      (leashState === 'open' || Date.now() - nativeState.checkedAt < NATIVE_RECHECK_MS);
+    if (nativeReady) {
+      return { ok: true, status: 'ready', backend: 'native', progress: 100, warm: true };
+    }
+    const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+    if (contexts.length === 0) {
+      return { ok: true, status: 'idle', backend: 'wasm', progress: 0, warm: false };
+    }
+    const existing = (await sendToOffscreen({ type: 'engine-status-request' })) ||
+      { ok: false, error: 'no-response' };
+    if (existing.ok) existing.backend = 'wasm';
+    return existing;
+  }
+
+  // A fresh toolbar selection may bypass the unavailable backoff exactly once;
+  // follow-up polls omit retryNative so a failed host cannot hot-loop.
+  openLeash(nativeOnly && retryNative);
+
+  // The toolbar popup deliberately wakes only the native companion. The
+  // native host reports readiness asynchronously after it has started (or
+  // attached to) kokoro_server.py, so expose that transition for popup
+  // polling. Never probe/create the offscreen engine in this branch: WASM
+  // remains lazy until an actual Play/Test Voice request needs the fallback.
+  if (nativeOnly) {
+    const nativeReady = nativeState.available === true &&
+      (leashState === 'open' || Date.now() - nativeState.checkedAt < NATIVE_RECHECK_MS);
+    if (nativeReady) {
+      return { ok: true, status: 'ready', backend: 'native', progress: 100, warm: true };
+    }
+    if (leashState === 'unavailable') {
+      if (await isNativeAvailable()) {
+        return { ok: true, status: 'ready', backend: 'native', progress: 100, warm: true };
+      }
+      return { ok: true, status: 'unavailable', backend: 'native', progress: 0, warm: false };
+    }
+    return { ok: true, status: 'starting', backend: 'native', progress: 0, warm: false };
+  }
+
   if (await isNativeAvailable()) {
     return { ok: true, status: 'ready', backend: 'native', progress: 100, warm: true };
   }

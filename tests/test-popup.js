@@ -50,10 +50,36 @@ describe('popup.js', () => {
     assert.match(popupJs, /function setDefaultVoice\(voiceId\)/);
   });
 
+  it('wakes only the native server and does not enumerate voices when the popup opens', () => {
+    assert.match(
+      popupJs,
+      /refreshEngineStatus\(\{ wake: true, nativeOnly: true, retryNative: true \}\)/,
+    );
+    const initialization = popupJs.match(
+      /chrome\.storage\.local\.get\(\['defaultVoice'[\s\S]*?\n}\);\n\nfunction showStatus/,
+    );
+    assert.ok(initialization, 'settings initialization callback not found');
+    assert.doesNotMatch(initialization[0], /loadVoices\(/);
+    assert.match(popupJs, /engine-status-request', wake, nativeOnly, retryNative/);
+  });
+
+  it('loads the full voice catalog only when the voice selector is engaged', () => {
+    assert.match(popupJs, /voiceSelect\.addEventListener\('focus', requestVoiceCatalog\)/);
+    assert.match(popupJs, /voiceSelect\.addEventListener\('pointerdown', requestVoiceCatalog\)/);
+    assert.match(popupJs, /voiceCatalogLoaded/);
+    assert.match(popupJs, /voicesLoading/);
+  });
+
   it('polls engine status while the model downloads', () => {
     assert.match(popupJs, /engine-status-request/);
     assert.match(popupJs, /Downloading voice model/);
     assert.match(popupJs, /scheduleEnginePoll/);
+  });
+
+  it('polls native startup without switching the poll to the WASM fallback', () => {
+    assert.match(popupJs, /case 'starting':[\s\S]*?Starting native Kokoro server/);
+    assert.match(popupJs, /scheduleEnginePoll\(\{ nativeOnly: true \}\)/);
+    assert.match(popupJs, /Native server unavailable — built-in engine starts on Play/);
   });
 
   it('persists snapped slider values on change and previews on input', () => {

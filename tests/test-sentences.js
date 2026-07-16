@@ -1,13 +1,15 @@
 /**
- * Tests for the sentence-splitting regex used in content.js.
+ * Tests for the linear sentence scanner used in content.js.
  * Validates that text is split into sentences correctly.
  */
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { describe, it } from 'node:test';
 
-// Sentence-splitting logic extracted from content.js extractSentencesFromBlock.
-// Keep in sync with the production regex.
-const sentenceRe = /[^!?…]*?(?:[!?…]+|\.(?!\d)|(?<!\d)\.)+["'”’]?\s*/g;
+const rootDir = path.resolve(import.meta.dirname, '..');
+const contentJs = fs.readFileSync(path.join(rootDir, 'content', 'content.js'), 'utf8');
 
 function hasReadableContent(text) {
   return /[\p{L}\p{N}]/u.test(text);
@@ -17,25 +19,49 @@ function stripLeadingNoise(text) {
   return text.replace(/^[^\p{L}\p{N}"'(\[«„“‘]+/u, '');
 }
 
-function splitSentences(text) {
-  const results = [];
-  let consumed = 0;
-  for (const match of text.matchAll(sentenceRe)) {
-    const raw = match[0];
-    const trimmed = stripLeadingNoise(raw.trim());
-    if (!hasReadableContent(trimmed)) {
-      consumed = match.index + raw.length;
-      continue;
-    }
-    results.push(trimmed);
-    consumed = match.index + raw.length;
-  }
-  const tail = stripLeadingNoise(text.slice(consumed).trim());
-  if (hasReadableContent(tail)) results.push(tail);
-  return results;
+function isDigitAt(text, index) {
+  if (index < 0 || index >= text.length) return false;
+  const code = text.charCodeAt(index);
+  return code >= 48 && code <= 57;
 }
 
-describe('Sentence splitting regex', () => {
+function isSentenceTerminatorAt(text, index) {
+  const char = text[index];
+  if (char === '!' || char === '?' || char === '…') return true;
+  return char === '.' && !(isDigitAt(text, index - 1) && isDigitAt(text, index + 1));
+}
+
+// Mirror of content.js#splitSentenceSpans. Keep in sync with production.
+function splitSentenceSpans(text) {
+  const spans = [];
+  let start = 0;
+  let index = 0;
+  while (index < text.length) {
+    if (!isSentenceTerminatorAt(text, index)) {
+      index++;
+      continue;
+    }
+
+    do index++; while (index < text.length && isSentenceTerminatorAt(text, index));
+    if (/["'”’]/.test(text[index] || '')) index++;
+    while (index < text.length && /\s/.test(text[index])) index++;
+
+    const raw = text.slice(start, index);
+    const trimmed = stripLeadingNoise(raw.trim());
+    if (hasReadableContent(trimmed)) spans.push({ start, end: index, text: trimmed });
+    start = index;
+  }
+
+  const tail = stripLeadingNoise(text.slice(start).trim());
+  if (hasReadableContent(tail)) spans.push({ start, end: text.length, text: tail });
+  return spans;
+}
+
+function splitSentences(text) {
+  return splitSentenceSpans(text).map((span) => span.text);
+}
+
+describe('linear sentence splitting', () => {
   it('splits simple period-delimited sentences', () => {
     const result = splitSentences('Hello world. How are you.');
     assert.deepEqual(result, ['Hello world.', 'How are you.']);
@@ -158,5 +184,48 @@ describe('Sentence splitting regex', () => {
     assert.ok(result[1].startsWith("I can introduce"));
     assert.ok(result[2].endsWith("master!"));
     assert.equal(result[3], 'Drop me an email if you are interested!');
+  });
+
+  it('keeps exact ordered character spans for one-pass DOM range mapping', () => {
+    const text = 'First.  Second?\nThird tail';
+    const spans = splitSentenceSpans(text);
+    assert.deepEqual(spans.map(({ start, end }) => text.slice(start, end)), [
+      'First.  ',
+      'Second?\n',
+      'Third tail',
+    ]);
+  });
+
+  it('handles a large punctuation-free block without quadratic backtracking', () => {
+    const text = 'a'.repeat(100_000);
+    const startedAt = performance.now();
+    const result = splitSentences(text);
+    const elapsedMs = performance.now() - startedAt;
+    assert.deepEqual(result, [text]);
+    // The removed lazy regex took multiple seconds at this size. This generous
+    // ceiling catches that regression while leaving ample room for loaded CI.
+    assert.ok(elapsedMs < 250, `linear scan took ${elapsedMs.toFixed(1)}ms`);
+  });
+});
+
+describe('content.js sentence-processing contracts', () => {
+  it('uses the linear scanner rather than the quadratic lazy regex', () => {
+    assert.match(contentJs, /function splitSentenceSpans\(text\)/);
+    assert.doesNotMatch(contentJs, /\[\^!\?…\]\*\?/);
+  });
+
+  it('maps every sentence span to DOM Ranges with one text-node walk', () => {
+    const helper = contentJs.match(/function charOffsetSpansToRanges\(container, spans\) \{([\s\S]*?)\n {2}\}/);
+    assert.ok(helper, 'charOffsetSpansToRanges not found');
+    assert.equal((helper[1].match(/createTreeWalker/g) || []).length, 1);
+    assert.doesNotMatch(contentJs, /function charOffsetsToRange\(/);
+  });
+
+  it('caches sentence structure until page content mutates, including root replacement', () => {
+    assert.match(contentJs, /let sentenceStructureCache = null/);
+    assert.match(contentJs, /new MutationObserver\(\(\) => invalidateSentenceStructureCache\(\)\)/);
+    assert.match(contentJs, /sentenceCacheObserver\.observe\(document\.body \|\| root/);
+    assert.match(contentJs, /entries: buildSentenceStructure\(root\)/);
+    assert.match(contentJs, /entry\.range\.getClientRects\(\)/);
   });
 });

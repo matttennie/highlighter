@@ -24,6 +24,14 @@ describe('error presentation', () => {
     assert.match(contentJs, /ensureVoiceOption\(selectEl, selectedVoice \|\| cachedVoice, 'Configured voice'\)/);
   });
 
+  it('defers in-page voice enumeration until the selector is used', () => {
+    assert.match(contentJs, /voiceSelect\.addEventListener\('focus', requestVoiceOptions\)/);
+    assert.match(contentJs, /voiceSelect\.addEventListener\('pointerdown', requestVoiceOptions\)/);
+    const settingsLoad = contentJs.match(/chrome\.storage\.local\.get\(\['defaultVoice', 'defaultSpeed'\][\s\S]*?\n    \}\);/);
+    assert.ok(settingsLoad, 'player settings loader not found');
+    assert.doesNotMatch(settingsLoad[0], /loadVoiceOptions\(/);
+  });
+
   it('keeps the player open until explicitly closed and exposes player controls', () => {
     assert.match(contentJs, /hltr-highlight-btn/);
     assert.match(contentJs, /hltr-close-btn/);
@@ -40,5 +48,21 @@ describe('error presentation', () => {
     assert.match(contentJs, /const relevantChangedKeys = \[\]/);
     assert.match(contentJs, /if \(!relevantChangedKeys\.length\) return;/);
     assert.doesNotMatch(contentJs, /changedKeys: Object\.keys\(changes\)/);
+  });
+});
+
+describe('extension reload recovery', () => {
+  it('lets a newly injected instance replace stale UI and document listeners', () => {
+    assert.match(contentJs, /const CONTENT_INSTANCE_ATTR = 'data-highlighter-tts-instance'/);
+    assert.match(contentJs, /document\.querySelectorAll\([\s\S]*?\.hltr-player[\s\S]*?\)\.forEach\(\(element\) => element\.remove\(\)\)/);
+    assert.match(contentJs, /if \(!isCurrentContentInstance\(\)\) return;/);
+    assert.doesNotMatch(contentJs, /if \(window\.__highlighterTtsExtensionId === chrome\.runtime\.id\)/);
+  });
+
+  it('shows the player and falls back cleanly when Chrome invalidates extension APIs', () => {
+    assert.match(contentJs, /const storageLocal = getExtensionStorageLocal\(\)/);
+    assert.match(contentJs, /if \(!storageLocal\) \{[\s\S]*?revealPlayer\(\)/);
+    assert.match(contentJs, /if \(!hasLiveExtensionRuntime\(\)\) \{[\s\S]*?fallbackSpeechSynthesis\(text, speed, requestId\)/);
+    assert.match(contentJs, /Extension was reloaded/);
   });
 });

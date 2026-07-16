@@ -62,6 +62,37 @@ try {
     throw new Error(`player entered error state: ${JSON.stringify(playerState)}`);
   }
 
+  // Let the one-sentence selection finish, then replay it. The second play
+  // must use the decoded Blob cache rather than synthesize/decode base64 again.
+  await page.locator('.hltr-play-pause[title="Play"]').waitFor({ timeout: 10000 });
+  await page.locator('.hltr-play-pause').click();
+  await page.locator('.hltr-play-pause[title="Pause"]').waitFor({ timeout: 5000 });
+  // Content debug events are flushed to extension storage in batches, so poll
+  // until the cache-hit event reaches storage rather than racing that flush.
+  const cacheEvidence = await extension.serviceWorker.evaluate(
+    () => new Promise((resolve) => {
+      const deadline = Date.now() + 4000;
+      const inspect = () => {
+        chrome.storage.local.get(['debugLog'], (data) => {
+          const entries = Array.isArray(data.debugLog) ? data.debugLog : [];
+          const evidence = {
+            cacheHits: entries.filter((entry) => entry.event === 'tts-cache-hit').length,
+            synthStarts: entries.filter((entry) => entry.event === 'tts-request-start').length,
+          };
+          if (evidence.cacheHits > 0 || Date.now() >= deadline) {
+            resolve(evidence);
+            return;
+          }
+          setTimeout(inspect, 100);
+        });
+      };
+      inspect();
+    })
+  );
+  if (cacheEvidence.cacheHits < 1 || cacheEvidence.synthStarts !== 1) {
+    throw new Error(`replay missed decoded audio cache: ${JSON.stringify(cacheEvidence)}`);
+  }
+
   console.log(
     JSON.stringify(
       {
@@ -70,6 +101,7 @@ try {
         testPageUrl: server.url,
         toggleResponse,
         playerState,
+        cacheEvidence,
       },
       null,
       2

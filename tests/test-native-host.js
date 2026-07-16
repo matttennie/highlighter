@@ -67,7 +67,7 @@ describe('server/native_host.py', () => {
   it('owned=True path spawns kokoro_server.py with the same interpreter, stderr to the err log', () => {
     assert.match(host, /ERR_LOG\s*=\s*["']\/tmp\/highlighter-kokoro\.err["']/);
     assert.match(host, /kokoro_server\.py/);
-    assert.match(host, /subprocess\.Popen\(\s*\[sys\.executable,\s*server_py\]/s);
+    assert.match(host, /subprocess\.Popen\(\s*\[sys\.executable,\s*os\.path\.join\(here,\s*"kokoro_server\.py"\)\]/s);
     assert.match(host, /stderr=errlog/);
     assert.match(host, /return True,\s*child,\s*ok/);
   });
@@ -103,9 +103,12 @@ describe('server/native_host.py', () => {
     assert.match(host, /finally:/);
   });
 
-  it('documents the known lifecycle ceilings with ponytail comments', () => {
-    assert.match(host, /ponytail:[\s\S]*SIGKILL/);          // orphan-on-SIGKILL limitation
-    assert.match(host, /ponytail:[\s\S]*pidfile refcount/); // multi-profile ceiling + upgrade path
+  it('starts the shared server outside Chrome via launchd and tracks its warmth claim', () => {
+    assert.match(host, /SHARED_TTS_DIR/);
+    assert.match(host, /launchctl", "submit"/);
+    assert.match(host, /write_marker\(\)/);
+    assert.match(host, /remove_marker\(\)/);
+    assert.match(host, /def _watch_port\(\)/);
   });
 
   it('watches the owned child and exits the host when it exits (idle self-exit → port drops)', () => {

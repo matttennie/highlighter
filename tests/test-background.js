@@ -63,8 +63,12 @@ describe('offscreen routing', () => {
     assert.match(backgroundJs, /offscreen-send-retry/);
   });
 
-  it('pre-warms the engine when the user toggles highlight mode', () => {
-    assert.match(backgroundJs, /function sendToggle\([\s\S]{0,200}?void preWarmEngine\(\)/);
+  it('does not warm the engine when the user only toggles highlight mode', () => {
+    const start = backgroundJs.indexOf('function sendToggle(');
+    const end = backgroundJs.indexOf('\nfunction sendToggleToActiveTab', start);
+    assert.ok(start !== -1 && end > start, 'sendToggle not found');
+    const sendToggle = backgroundJs.slice(start, end);
+    assert.doesNotMatch(sendToggle, /preWarmEngine|openLeash|ensureOffscreenDocument/);
   });
 });
 
@@ -157,6 +161,8 @@ describe('native-first routing', () => {
   it('marks native down on failure so callers fall back to offscreen', () => {
     assert.match(backgroundJs, /function markNativeDown\(\)/);
     assert.match(backgroundJs, /nativeState = \{ available: false, checkedAt: Date\.now\(\) \}/);
+    assert.match(backgroundJs, /function markNativeUnknown\(\)/);
+    assert.match(backgroundJs, /nativeState = \{ available: null, checkedAt: 0 \}/);
   });
 
   it('routes tts-request to native /tts first, falling back to offscreen on failure', () => {
@@ -172,13 +178,20 @@ describe('native-first routing', () => {
     assert.match(ttsFn[0], /sendToOffscreen\(\{/);
   });
 
-  it('routes voices-request to native /voices first, falling back to offscreen', () => {
-    assert.match(backgroundJs, /fetch\(`\$\{NATIVE_BASE_URL\}\/voices`/);
+  it('serves a static voice catalog without starting either backend', () => {
     const voicesFn = backgroundJs.match(/async function handleVoicesRequest\([\s\S]*?\n}\n/);
     assert.ok(voicesFn, 'handleVoicesRequest not found');
-    assert.match(voicesFn[0], /isNativeAvailable\(\)/);
-    assert.match(voicesFn[0], /ok: true, voices: payload\.voices/);
-    assert.match(voicesFn[0], /ensureOffscreenDocument\(\)/);
+    assert.match(backgroundJs, /const VOICE_CATALOG = VOICE_GROUPS\.flatMap/);
+    const catalogSource = backgroundJs.slice(
+      backgroundJs.indexOf('const VOICE_GROUPS'),
+      backgroundJs.indexOf('// Native companion server'),
+    );
+    const voiceIds = [...catalogSource.matchAll(/'([a-z]{2}_[a-z0-9]+)'/g)].map((match) => match[1]);
+    assert.equal(voiceIds.length, 54);
+    assert.equal(new Set(voiceIds).size, 54);
+    assert.ok(voiceIds.includes('bf_emma'));
+    assert.match(voicesFn[0], /ok: true, voices: VOICE_CATALOG/);
+    assert.doesNotMatch(voicesFn[0], /openLeash|isNativeAvailable|ensureOffscreenDocument|sendToOffscreen|fetch/);
   });
 
   it('reports the native backend immediately for engine-status without touching offscreen', () => {
@@ -191,11 +204,31 @@ describe('native-first routing', () => {
     assert.match(statusFn[0], /backend = 'wasm'/);
   });
 
-  it('gates offscreen creation in preWarmEngine on native availability', () => {
-    const helper = backgroundJs.match(/async function preWarmEngine\(\)[\s\S]*?\n}\n/);
-    assert.ok(helper, 'preWarmEngine helper not found');
-    assert.match(helper[0], /isNativeAvailable\(\)/);
-    assert.match(helper[0], /ensureOffscreenDocument\(\)/);
+  it('supports a side-effect-free status peek that never starts either backend', () => {
+    const helper = backgroundJs.match(/async function handleEngineStatusRequest\([^)]*\)[\s\S]*?\n}\n/);
+    assert.ok(helper, 'handleEngineStatusRequest helper not found');
+    const peekBranch = helper[0].slice(0, helper[0].indexOf('\n  openLeash('));
+    assert.match(peekBranch, /if \(!wake\)/);
+    assert.match(peekBranch, /getContexts\(\{ contextTypes: \['OFFSCREEN_DOCUMENT'\] \}\)/);
+    assert.match(peekBranch, /status: 'idle', backend: 'wasm'/);
+    assert.doesNotMatch(peekBranch, /openLeash\(|isNativeAvailable\(|ensureOffscreenDocument\(/);
+    assert.match(backgroundJs, /wake: msg\.wake !== false/);
+    assert.match(backgroundJs, /nativeOnly: msg\.nativeOnly === true/);
+    assert.match(backgroundJs, /retryNative: msg\.retryNative === true/);
+  });
+
+  it('starts only the native leash for a native-only waking status request', () => {
+    const helper = backgroundJs.match(/async function handleEngineStatusRequest\([^)]*\)[\s\S]*?\n}\n/);
+    assert.ok(helper, 'handleEngineStatusRequest helper not found');
+    assert.match(helper[0], /nativeOnly = false/);
+    assert.match(helper[0], /retryNative = false/);
+    assert.match(helper[0], /openLeash\(nativeOnly && retryNative\);[\s\S]*?if \(nativeOnly\)/);
+    const nativeOnlyBranch = helper[0].match(/if \(nativeOnly\) \{[\s\S]*?\n  \}/);
+    assert.ok(nativeOnlyBranch, 'native-only wake branch not found');
+    assert.match(nativeOnlyBranch[0], /status: 'starting', backend: 'native'/);
+    assert.match(nativeOnlyBranch[0], /status: 'unavailable', backend: 'native'/);
+    assert.match(nativeOnlyBranch[0], /if \(await isNativeAvailable\(\)\)/);
+    assert.doesNotMatch(nativeOnlyBranch[0], /ensureOffscreenDocument|sendToOffscreen/);
   });
 
   it('leaves tts-cancel routing to the offscreen queue only (native synths are cheap to waste)', () => {
@@ -218,43 +251,47 @@ describe('native-messaging server leash', () => {
   });
 
   it('openLeash is idempotent and never opens a second port', () => {
-    const fn = backgroundJs.match(/function openLeash\(\)[\s\S]*?\n}\n/);
+    const fn = backgroundJs.match(/function openLeash\([^)]*\)[\s\S]*?\n}\n/);
     assert.ok(fn, 'openLeash not found');
     // no-op while already opening/open, and never a duplicate when a port lives
     assert.match(fn[0], /if \(leashState === 'open' \|\| leashState === 'opening'\) return/);
     assert.match(fn[0], /if \(nativePort\) return/);
     // backoff while unavailable
-    assert.match(fn[0], /leashState === 'unavailable' && Date\.now\(\) - leashUnavailableAt < LEASH_UNAVAILABLE_BACKOFF_MS/);
+    assert.match(fn[0], /!retryUnavailable && leashState === 'unavailable'/);
+    assert.match(fn[0], /Date\.now\(\) - leashUnavailableAt < LEASH_UNAVAILABLE_BACKOFF_MS/);
     // spawns the host via connectNative
+    assert.match(fn[0], /native-leash-opening/);
     assert.match(fn[0], /chrome\.runtime\.connectNative\(NATIVE_HOST\)/);
   });
 
   it('server-status ok forces native availability; not-ok backs off to WASM', () => {
-    const fn = backgroundJs.match(/function openLeash\(\)[\s\S]*?\n}\n/);
+    const fn = backgroundJs.match(/function openLeash\([^)]*\)[\s\S]*?\n}\n/);
     assert.match(fn[0], /msg\.type !== 'server-status'/);
     assert.match(fn[0], /nativeState = \{ available: true, checkedAt: Date\.now\(\) \}/);
     assert.match(fn[0], /markNativeDown\(\)/);
+    assert.match(fn[0], /nativePort\?\.disconnect\(\)/);
   });
 
   it('onDisconnect marks native down and reopens only if it had opened', () => {
-    const fn = backgroundJs.match(/function openLeash\(\)[\s\S]*?\n}\n/);
+    const fn = backgroundJs.match(/function openLeash\([^)]*\)[\s\S]*?\n}\n/);
     assert.match(fn[0], /onDisconnect\.addListener/);
     assert.match(fn[0], /const hadOpened = leashState === 'open'/);
     assert.match(fn[0], /leashState = hadOpened \? 'closed' : 'unavailable'/);
     assert.match(fn[0], /nativePort = null/);
     assert.match(fn[0], /clearInterval\(leashPingInterval\)/);
+    assert.match(fn[0], /hadOpened[\s\S]*?markNativeDown\(\)[\s\S]*?markNativeUnknown\(\)/);
   });
 
   it('keeps the SW alive with a 25s ping under the native port', () => {
-    const fn = backgroundJs.match(/function openLeash\(\)[\s\S]*?\n}\n/);
+    const fn = backgroundJs.match(/function openLeash\([^)]*\)[\s\S]*?\n}\n/);
     assert.match(fn[0], /setInterval\(\(\)\s*=>\s*\{[\s\S]*?nativePort\?\.postMessage\(\{ type: 'ping' \}\)[\s\S]*?\},\s*LEASH_PING_MS\)/);
   });
 
-  it('opens the leash on every engagement path', () => {
-    for (const name of ['preWarmEngine', 'handleTtsRequest', 'handleVoicesRequest', 'handleEngineStatusRequest']) {
+  it('opens the leash on synthesis and explicit waking-status paths', () => {
+    for (const name of ['handleTtsRequest', 'handleEngineStatusRequest']) {
       const fn = backgroundJs.match(new RegExp(`async function ${name}\\([^)]*\\)\\s*\\{[\\s\\S]*?\\n}\\n`));
       assert.ok(fn, `${name} not found`);
-      assert.match(fn[0], /openLeash\(\)/, `${name} must openLeash`);
+      assert.match(fn[0], /openLeash\(/, `${name} must openLeash`);
     }
   });
 });
