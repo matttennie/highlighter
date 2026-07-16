@@ -40,6 +40,10 @@ SESSIONS_DIR = os.environ.get(
 SHARED_TTS_DIR = os.environ.get(
     "KOKORO_SHARED_TTS_DIR",
     os.path.join(os.path.expanduser("~"), ".claude", "skills", "tts"))
+# Per-host-pid label: launchd throttles restarts of a recently-exited label,
+# which can delay (or swallow) a resubmitted job — a fresh label sidesteps
+# that. Dead labels stay registered until logout; cosmetic.
+SHARED_JOB_LABEL = "com.highlighter.kokoro-shared.%d" % os.getpid()
 MARKER_PATH = os.path.join(SESSIONS_DIR, "chrome-%d" % os.getpid())
 
 # Guards the single shutdown path so the stdin-EOF/SIGTERM reap and the
@@ -144,26 +148,43 @@ def start_server(port):
     here = os.path.dirname(os.path.abspath(__file__))
     shared_py = os.path.join(SHARED_TTS_DIR, ".venv", "bin", "python3")
     shared_srv = os.path.join(SHARED_TTS_DIR, "kokoro_server.py")
-    shared = os.path.exists(shared_py) and os.path.exists(shared_srv)
-    if shared:
-        cmd = [shared_py, shared_srv]
-    else:
-        cmd = [sys.executable, os.path.join(here, "kokoro_server.py")]
+    if os.path.exists(shared_py) and os.path.exists(shared_srv):
+        # Shared server: spawn via launchd, NOT as our child. Newer macOS
+        # refuses ad-hoc-signed dylibs anywhere in a GUI app's process tree
+        # ("library load disallowed by system policy"), so a Chrome-descended
+        # server can't load the venv's espeak library. A launchd job gets the
+        # same policy context as a terminal run, which works. It manages its
+        # own lifetime via warmth claims — never owned, watched, or reaped.
+        _spawn_shared_via_launchd([shared_py, shared_srv])
+        ok = wait_for_health(port)
+        return False, None, ok
     errlog = open(ERR_LOG, "ab")
-    # Shared server: it manages its own lifetime via warmth claims, so we
-    # detach it (start_new_session) and never own/reap it. Bundled fallback
-    # keeps the old owned/reaped semantics.
     child = subprocess.Popen(
-        cmd,
+        [sys.executable, os.path.join(here, "kokoro_server.py")],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=errlog,
-        start_new_session=shared,
     )
     ok = wait_for_health(port)
-    if shared:
-        return False, None, ok  # not ours to watch or reap
     return True, child, ok
+
+
+def _spawn_shared_via_launchd(cmd):
+    """Submit the shared server as a launchd job so launchd (not Chrome) is
+    the responsible process. KOKORO_* env overrides travel as argv via
+    /usr/bin/env — launchctl submit passes no environment. The label is
+    removed first: a previous job stays registered after its process exits,
+    and we only get here when nothing is listening on the port."""
+    env_prefix = ["%s=%s" % (k, v) for k, v in os.environ.items()
+                  if k.startswith("KOKORO_")]
+    with open(ERR_LOG, "ab") as errlog:
+        subprocess.run(["launchctl", "remove", SHARED_JOB_LABEL],
+                       stdout=errlog, stderr=errlog)
+        subprocess.run(
+            ["launchctl", "submit", "-l", SHARED_JOB_LABEL,
+             "-o", "/dev/null", "-e", ERR_LOG,
+             "--", "/usr/bin/env"] + env_prefix + cmd,
+            stdout=errlog, stderr=errlog)
 
 
 def reap(child):
