@@ -57,9 +57,10 @@ npm run build
 - Open `chrome://extensions`
 - Enable `Developer mode`
 - Click `Load unpacked`
-- Select the repository root: the `highlighter` folder that directly contains
-  `manifest.json`. Do not leave Chrome pointed at a temporary `.worktrees/...`
-  checkout or the `kokoro-extension-test` scratch build.
+- Select `~/Desktop/AI/highlighter/chrome-extension`. This visible, generated
+  folder is refreshed by `npm run build` and is the canonical unpacked-extension
+  path. Do not leave Chrome pointed at the repository root, a temporary
+  `.worktrees/...` checkout, or the `kokoro-extension-test` scratch build.
 
 No API key or account is required. The first time you synthesize speech without
 the native server running, it downloads the Kokoro voice model (~92 MB) and
@@ -118,7 +119,7 @@ npm run build   # bundles the offscreen TTS engine (required before loading)
 npm test        # unit tests
 ```
 
-Load the extension unpacked from the repository root (`chrome://extensions` →
+Load the extension unpacked from `chrome-extension/` (`chrome://extensions` →
 Developer mode → Load unpacked) after running the build. See
 [Extension development and load path](docs/extension-development.md) for the
 reload checklist and worktree handoff procedure.

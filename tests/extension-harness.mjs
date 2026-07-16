@@ -4,7 +4,8 @@ import path from 'node:path';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { chromium } from 'playwright';
 
-export const rootDir = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+export const projectDir = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+export const extensionDir = path.join(projectDir, 'chrome-extension');
 export const testHtml = `
 <!doctype html>
 <html>
@@ -65,15 +66,19 @@ export async function startTestServer() {
   };
 }
 
-export async function launchExtension({ startedAt, profilePrefix = 'highlighter-e2e-' }) {
+export async function launchExtension({
+  startedAt,
+  profilePrefix = 'highlighter-e2e-',
+  loadPath = extensionDir,
+}) {
   const userDataDir = await mkdtemp(path.join(os.tmpdir(), profilePrefix));
   const context = await chromium.launchPersistentContext(userDataDir, {
     headless: false,
     args: [
       '--disable-crash-reporter',
       '--disable-crashpad',
-      `--disable-extensions-except=${rootDir}`,
-      `--load-extension=${rootDir}`,
+      `--disable-extensions-except=${loadPath}`,
+      `--load-extension=${loadPath}`,
     ],
   });
 

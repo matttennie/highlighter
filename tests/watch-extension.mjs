@@ -2,6 +2,7 @@ import process from 'node:process';
 import {
   attachHighlighterConsole,
   launchExtension,
+  projectDir,
   startTestServer,
   stamp,
 } from './extension-harness.mjs';
@@ -12,6 +13,9 @@ const server = await startTestServer();
 const extension = await launchExtension({
   startedAt,
   profilePrefix: 'highlighter-watch-',
+  // The watcher intentionally loads live source. Automated regressions and
+  // normal Chrome installs load the generated chrome-extension/ artifact.
+  loadPath: projectDir,
 });
 
 const testPage = await extension.context.newPage();

@@ -10,6 +10,7 @@ playwright-report/
 test-results/
 offscreen/tts-engine.bundle.js
 offscreen/ort/
+chrome-extension/
 .superpowers/
 kokoro-extension-test/
 server/.venv/
