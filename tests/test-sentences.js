@@ -1,8 +1,8 @@
 /**
  * Tests for sentence segmentation used in content.js.
- * The splitter now uses the platform's ICU segmenter (Intl.Segmenter) instead
- * of a regex. `segmentSentences` below is a byte-identical mirror of
- * content.js#segmentSentences — keep it in sync.
+ * The splitter uses the platform's ICU segmenter (Intl.Segmenter) plus a
+ * linear known-abbreviation merge pass. `splitSentenceSpans` below mirrors
+ * content.js#splitSentenceSpans — keep it in sync.
  *
  * These tests EXECUTE real Intl.Segmenter output (Node ships ICU too), so they
  * document actual behavior, not the ideal. V8's ICU ships no abbreviation-
@@ -12,7 +12,13 @@
  * deviates from the old regex are called out inline.
  */
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { describe, it } from 'node:test';
+
+const rootDir = path.resolve(import.meta.dirname, '..');
+const contentJs = fs.readFileSync(path.join(rootDir, 'content', 'content.js'), 'utf8');
 
 // ── Mirror of content.js — keep byte-identical ───────────────────────
 function hasReadableContent(text) {
@@ -30,27 +36,33 @@ const ABBREVIATIONS = new Set([
   'u.s.', 'u.k.', 'u.n.', 'd.c.',
 ]);
 const sentenceSegmenter = new Intl.Segmenter('en', { granularity: 'sentence' });
-function segmentSentences(text) {
-  const raw = [];
-  for (const seg of sentenceSegmenter.segment(text)) {
-    raw.push({ start: seg.index, end: seg.index + seg.segment.length });
-  }
+function endsWithMergeableAbbreviation(text, start, end) {
+  let cursor = end - 1;
+  while (cursor >= start && /\s/u.test(text[cursor])) cursor--;
+  const wordEnd = cursor + 1;
+  while (cursor >= start && !/\s/u.test(text[cursor])) cursor--;
+  const lastWord = text.slice(cursor + 1, wordEnd).toLowerCase();
+  return ABBREVIATIONS.has(lastWord) || /^[a-z]\.$/.test(lastWord);
+}
 
-  // Merge a segment into its follower when it ends in a known abbreviation;
-  // apply iteratively so chains collapse ("J. R. R. Tolkien" → one segment).
-  for (let i = 0; i < raw.length - 1; ) {
-    const words = text.slice(raw[i].start, raw[i].end).trim().split(/\s+/);
-    const lastWord = words[words.length - 1].toLowerCase();
-    if (ABBREVIATIONS.has(lastWord) || /^[a-z]\.$/.test(lastWord)) {
-      raw[i] = { start: raw[i].start, end: raw[i + 1].end };
-      raw.splice(i + 1, 1);
+function splitSentenceSpans(text) {
+  const merged = [];
+  let current = null;
+  for (const segment of sentenceSegmenter.segment(text)) {
+    const next = { start: segment.index, end: segment.index + segment.segment.length };
+    if (!current) {
+      current = next;
+    } else if (endsWithMergeableAbbreviation(text, current.start, current.end)) {
+      current.end = next.end;
     } else {
-      i++;
+      merged.push(current);
+      current = next;
     }
   }
+  if (current) merged.push(current);
 
   const results = [];
-  for (const { start, end } of raw) {
+  for (const { start, end } of merged) {
     // Drop pure-punctuation/whitespace segments (":)", stray marks) — TTS
     // engines either error or pronounce them literally ("colon close-paren").
     const trimmed = stripLeadingNoise(text.slice(start, end).trim());
@@ -62,7 +74,7 @@ function segmentSentences(text) {
 // ─────────────────────────────────────────────────────────────────────
 
 // Convenience: just the sentence texts.
-const texts = (s) => segmentSentences(s).map((r) => r.text);
+const texts = (s) => splitSentenceSpans(s).map((r) => r.text);
 
 describe('ICU sentence segmentation', () => {
   it('splits simple period-delimited sentences', () => {
@@ -186,7 +198,7 @@ describe('ICU sentence segmentation', () => {
   });
 
   it('reports char offsets into the raw (untrimmed) segment', () => {
-    const segs = segmentSentences('This is one. This is two.');
+    const segs = splitSentenceSpans('This is one. This is two.');
     assert.deepEqual(segs.map((s) => [s.start, s.end]), [[0, 13], [13, 25]]);
     // Offsets slice back to the raw (untrimmed) segments.
     const src = 'This is one. This is two.';
@@ -207,5 +219,49 @@ describe('ICU sentence segmentation', () => {
     assert.ok(result[1].startsWith('I can introduce'));
     assert.ok(result[2].includes('learn from a master!')); // ICU keeps ":)" glued
     assert.equal(result[3], 'Drop me an email if you are interested!');
+  });
+
+  it('keeps exact ordered character spans for one-pass DOM range mapping', () => {
+    const text = 'First.  Second?\nThird tail';
+    const spans = splitSentenceSpans(text);
+    assert.deepEqual(spans.map(({ start, end }) => text.slice(start, end)), [
+      'First.  ',
+      'Second?\n',
+      'Third tail',
+    ]);
+  });
+
+  it('handles a large punctuation-free block without quadratic work', () => {
+    const text = 'a'.repeat(100_000);
+    const startedAt = performance.now();
+    const result = texts(text);
+    const elapsedMs = performance.now() - startedAt;
+    assert.deepEqual(result, [text]);
+    assert.ok(elapsedMs < 250, `ICU segmentation took ${elapsedMs.toFixed(1)}ms`);
+  });
+});
+
+describe('content.js sentence-processing contracts', () => {
+  it('uses ICU segmentation with a linear merge pass, not the quadratic lazy regex', () => {
+    assert.match(contentJs, /new Intl\.Segmenter\('en', \{ granularity: 'sentence' \}\)/);
+    assert.match(contentJs, /function splitSentenceSpans\(text\)/);
+    assert.match(contentJs, /for \(const segment of sentenceSegmenter\.segment\(text\)\)/);
+    assert.doesNotMatch(contentJs, /\.splice\(/);
+    assert.doesNotMatch(contentJs, /\[\^!\?…\]\*\?/);
+  });
+
+  it('maps every sentence span to DOM Ranges with one text-node walk', () => {
+    const helper = contentJs.match(/function charOffsetSpansToRanges\(container, spans\) \{([\s\S]*?)\n {2}\}/);
+    assert.ok(helper, 'charOffsetSpansToRanges not found');
+    assert.equal((helper[1].match(/createTreeWalker/g) || []).length, 1);
+    assert.doesNotMatch(contentJs, /function charOffsetsToRange\(/);
+  });
+
+  it('caches sentence structure until page content mutates, including root replacement', () => {
+    assert.match(contentJs, /let sentenceStructureCache = null/);
+    assert.match(contentJs, /new MutationObserver\(\(\) => invalidateSentenceStructureCache\(\)\)/);
+    assert.match(contentJs, /sentenceCacheObserver\.observe\(document\.body \|\| root/);
+    assert.match(contentJs, /entries: buildSentenceStructure\(root\)/);
+    assert.match(contentJs, /entry\.range\.getClientRects\(\)/);
   });
 });

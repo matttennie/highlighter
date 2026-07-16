@@ -1,13 +1,42 @@
 (() => {
   'use strict';
-  // If the same version is already loaded, skip. 
-  // If a different version (e.g. after reload) is loaded, we allow this one to 
-  // take over but we try to avoid double-initializing as much as possible.
-  if (window.__highlighterTtsExtensionId === chrome.runtime.id) {
-    return;
-  }
+
+  // A reloaded unpacked extension invalidates the old content script's Chrome
+  // APIs without removing its DOM or document listeners. Background injection
+  // only happens after messaging that stale instance fails, so every actual
+  // execution should take ownership instead of returning solely because the
+  // extension id is unchanged. The token makes superseded document listeners
+  // inert; removing the known UI nodes prevents duplicate players/cursors.
+  const CONTENT_INSTANCE_ATTR = 'data-highlighter-tts-instance';
+  const contentInstanceToken = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  document.documentElement.classList.remove('highlighter-mode');
+  document.querySelectorAll(
+    '.highlighter-cursor, .highlighter-stroke-overlay, .highlighter-indicator, ' +
+    '.hltr-player, .hltr-menu-panel, .hltr-toast'
+  ).forEach((element) => element.remove());
+  document.documentElement.setAttribute(CONTENT_INSTANCE_ATTR, contentInstanceToken);
   window.__highlighterTtsExtensionId = chrome.runtime.id;
   window.__highlighterTtsContentLoaded = true;
+
+  function isCurrentContentInstance() {
+    return document.documentElement.getAttribute(CONTENT_INSTANCE_ATTR) === contentInstanceToken;
+  }
+
+  function hasLiveExtensionRuntime() {
+    try {
+      return typeof chrome !== 'undefined' && Boolean(chrome.runtime?.id && chrome.runtime?.sendMessage);
+    } catch {
+      return false;
+    }
+  }
+
+  function getExtensionStorageLocal() {
+    try {
+      return typeof chrome !== 'undefined' ? chrome.storage?.local || null : null;
+    } catch {
+      return null;
+    }
+  }
 
   // ── Constants ──────────────────────────────────────────────────────
   const DEFAULT_VOICE_ID = 'bf_emma';
@@ -27,6 +56,8 @@
   // ~500KB per sentence WAV, worst case ~30MB in page memory — acceptable,
   // bounded, and freed on stroke/navigation/close via invalidateAudioCache.
   const AUDIO_CACHE_LIMIT = 64;     // LRU bound on cached sentence audio
+  const STROKE_POINT_MIN_DISTANCE_SQ = 4; // ignore sub-2px pointer jitter
+  const MAX_STROKE_POINTS = 1024;   // bound SVG path work during very long strokes
   // Kokoro truncates synthesis around 512 phoneme tokens (~450 chars); we cap
   // well below that so worst-case per-request synth stays roughly 10-14s on slow
   // CPUs. Longer sentences are split at clause boundaries so nothing is lost;
@@ -42,6 +73,13 @@
   let highlightMode = false;
   let isPainting    = false;
   let strokePoints  = [];
+  let strokeRenderFrame = 0;
+
+  // Sentence boundaries and DOM Ranges are stable until the content root
+  // mutates. Geometry is intentionally re-read for every stroke because it
+  // changes on scroll/resize without a DOM mutation.
+  let sentenceStructureCache = null;
+  let sentenceCacheObserver = null;
 
   // Playback state: sentences resolved from the last stroke
   let pbSentences   = [];   // [{text, range, startLineY, endLineY}]
@@ -91,8 +129,10 @@
 
   // ── Audio cache + prefetch ────────────────────────────────────────
   // Per-sentence cache so skip-back / pre-fetched-N+1 don't burn extra synth calls.
-  // Insertion-ordered Map gives us cheap LRU when we delete the oldest entry on overflow.
-  const audioCache = new Map();      // sentenceIdx → { audioDataUrl, voice, speed }
+  // Runtime messaging supplies base64 once; cache decoded Blobs so replay and
+  // skip-back never repeat the large atob/typed-array allocation. An
+  // insertion-ordered Map gives us cheap LRU eviction.
+  const audioCache = new Map();      // sentenceIdx → { audioBlob, voice, speed }
   const pendingPrefetch = new Map(); // sentenceIdx → { token: { cancelled }, voice, speed, waiter }
   let prefetchGeneration = 0;        // bumped on voice/speed change to drop stale results
   let skipDebounceTimer = 0;
@@ -111,7 +151,7 @@
   }
 
   function persistDebugEvent(source, event, details = {}) {
-    if (!chrome?.runtime?.sendMessage) return;
+    if (!hasLiveExtensionRuntime()) return;
     try {
       chrome.runtime.sendMessage(
         {
@@ -142,7 +182,10 @@
         logDebug('settings-load-failed', { error: storageError });
         return;
       }
-      if (data.articleMode !== undefined) articleModeEnabled = data.articleMode;
+      if (data.articleMode !== undefined && data.articleMode !== articleModeEnabled) {
+        articleModeEnabled = data.articleMode;
+        invalidateSentenceStructureCache();
+      }
       if (data.defaultVoice) cachedVoice = data.defaultVoice;
       if (data.defaultSpeed) cachedSpeed = parseFloat(data.defaultSpeed) || 1.0;
       logDebug('settings-loaded', {
@@ -157,6 +200,7 @@
 
     if (changes.articleMode) {
       articleModeEnabled = changes.articleMode.newValue;
+      invalidateSentenceStructureCache();
       relevantChangedKeys.push('articleMode');
     }
     if (changes.defaultVoice) {
@@ -262,7 +306,54 @@
     if (strokePath) strokePath.setAttribute('d', buildPathData(strokePoints));
   }
 
+  function scheduleStrokeRender() {
+    if (strokeRenderFrame) return;
+    strokeRenderFrame = requestAnimationFrame(() => {
+      strokeRenderFrame = 0;
+      renderStroke();
+    });
+  }
+
+  function flushStrokeRender() {
+    if (strokeRenderFrame) {
+      cancelAnimationFrame(strokeRenderFrame);
+      strokeRenderFrame = 0;
+    }
+    renderStroke();
+  }
+
+  function compactStrokePoints() {
+    if (strokePoints.length <= MAX_STROKE_POINTS) return;
+    const last = strokePoints[strokePoints.length - 1];
+    const compacted = [strokePoints[0]];
+    for (let i = 2; i < strokePoints.length - 1; i += 2) compacted.push(strokePoints[i]);
+    compacted.push(last);
+    strokePoints = compacted;
+  }
+
+  function appendStrokePoint(point, force = false) {
+    const last = strokePoints[strokePoints.length - 1];
+    if (!last) {
+      strokePoints.push(point);
+    } else {
+      const dx = point.x - last.x;
+      const dy = point.y - last.y;
+      if (force && dx === 0 && dy === 0) {
+        // Keep a tap as a single point so buildPathData emits its visible
+        // 0.1px segment rather than a zero-length two-point path.
+      } else if (force || dx * dx + dy * dy >= STROKE_POINT_MIN_DISTANCE_SQ) {
+        strokePoints.push(point);
+      }
+    }
+    compactStrokePoints();
+    scheduleStrokeRender();
+  }
+
   function clearStroke() {
+    if (strokeRenderFrame) {
+      cancelAnimationFrame(strokeRenderFrame);
+      strokeRenderFrame = 0;
+    }
     strokePoints = [];
     if (strokePath) strokePath.setAttribute('d', '');
   }
@@ -503,30 +594,108 @@
 
   // ── Sentence collection ────────────────────────────────────────────
   function collectSentences() {
+    const root = articleModeEnabled ? getContentRoot() : document.body;
+    if (!root) return [];
+
+    let cacheWasBuilt = false;
+    if (!sentenceStructureCache ||
+        sentenceStructureCache.root !== root ||
+        sentenceStructureCache.articleMode !== articleModeEnabled) {
+      sentenceStructureCache = {
+        root,
+        articleMode: articleModeEnabled,
+        entries: buildSentenceStructure(root),
+      };
+      watchSentenceRoot(root);
+      cacheWasBuilt = true;
+    }
+
+    // Ranges are cached, but viewport coordinates are not: scrolling, font
+    // loading, and responsive layout can all move a sentence without mutating
+    // its text nodes.
     const results = [];
-    const seen    = new Set();
+    const visibleBlocks = new WeakMap();
+    for (const entry of sentenceStructureCache.entries) {
+      let visible = visibleBlocks.get(entry.block);
+      if (visible === undefined) {
+        // buildSentenceStructure already performed this check on a fresh
+        // cache; avoid immediately forcing the same style/layout read twice.
+        visible = cacheWasBuilt || isElementVisible(entry.block);
+        visibleBlocks.set(entry.block, visible);
+      }
+      if (!visible) continue;
+      const rects = entry.range.getClientRects();
+      if (!rects.length) continue;
+      results.push({
+        text: entry.text,
+        range: entry.range,
+        blockIdx: entry.blockIdx,
+        startLineY: rects[0].top,
+        endLineY: rects[rects.length - 1].top,
+      });
+    }
+
+    results.sort((a, b) => a.startLineY - b.startLineY);
+    return results;
+  }
+
+  function buildSentenceStructure(root) {
+    const entries = [];
+    const seen = new Set();
+    const nearestBlockCache = new WeakMap();
+    const displayCache = new WeakMap();
     // Per-block counter — sentences from the same block share this value so
     // pauseBeforeNext can tell a paragraph break from a sentence boundary.
-    let blockIdx  = 0;
+    let blockIdx = 0;
 
-    const root = articleModeEnabled ? getContentRoot() : document.body;
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
     let textNode;
     while ((textNode = walker.nextNode())) {
       if (!textNode.textContent.trim()) continue;
-      const block = nearestLeafBlock(textNode);
+      const parent = textNode.parentElement;
+      if (!parent) continue;
+      let block;
+      if (nearestBlockCache.has(parent)) {
+        block = nearestBlockCache.get(parent);
+      } else {
+        block = nearestLeafBlock(textNode, displayCache);
+        nearestBlockCache.set(parent, block);
+      }
       if (!block || seen.has(block)) continue;
       seen.add(block);
       if (!isElementVisible(block)) continue;
       if (articleModeEnabled && isNonContent(block)) continue;
       const sents = extractSentencesFromBlock(block);
       if (!sents.length) continue;
-      for (const s of sents) { s.blockIdx = blockIdx; results.push(s); }
+      for (const sentence of sents) {
+        entries.push({ ...sentence, block, blockIdx });
+      }
       blockIdx++;
     }
+    return entries;
+  }
 
-    results.sort((a, b) => a.startLineY - b.startLineY);
-    return results;
+  function invalidateSentenceStructureCache() {
+    sentenceStructureCache = null;
+    if (sentenceCacheObserver) {
+      sentenceCacheObserver.disconnect();
+      sentenceCacheObserver = null;
+    }
+  }
+
+  function watchSentenceRoot(root) {
+    if (sentenceCacheObserver) sentenceCacheObserver.disconnect();
+    sentenceCacheObserver = new MutationObserver(() => invalidateSentenceStructureCache());
+    // Observe body rather than only the chosen article root so SPA navigation
+    // that replaces <main>/<article> also invalidates the detached Ranges.
+    // Extension UI is mounted directly under <html>, outside this observer.
+    sentenceCacheObserver.observe(document.body || root, {
+      subtree: true,
+      childList: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ['class', 'style', 'hidden', 'role', 'aria-hidden'],
+    });
   }
 
   const BLOCK_DISPLAYS = new Set([
@@ -534,14 +703,19 @@
     'table', 'table-row', 'table-cell', 'table-caption',
   ]);
 
-  function nearestLeafBlock(textNode) {
+  function cachedDisplay(el, displayCache) {
+    if (!displayCache.has(el)) displayCache.set(el, window.getComputedStyle(el).display);
+    return displayCache.get(el);
+  }
+
+  function nearestLeafBlock(textNode, displayCache) {
     let el = textNode.parentElement;
     while (el && el !== document.body) {
-      const display = window.getComputedStyle(el).display;
+      const display = cachedDisplay(el, displayCache);
       if (BLOCK_DISPLAYS.has(display)) {
         let hasBlockChild = false;
         for (const child of el.children) {
-          if (BLOCK_DISPLAYS.has(window.getComputedStyle(child).display)) {
+          if (BLOCK_DISPLAYS.has(cachedDisplay(child, displayCache))) {
             hasBlockChild = true;
             break;
           }
@@ -580,55 +754,53 @@
     'u.s.', 'u.k.', 'u.n.', 'd.c.',
   ]);
   const sentenceSegmenter = new Intl.Segmenter('en', { granularity: 'sentence' });
-  function segmentSentences(text) {
-    const raw = [];
-    for (const seg of sentenceSegmenter.segment(text)) {
-      raw.push({ start: seg.index, end: seg.index + seg.segment.length });
-    }
 
-    // Merge a segment into its follower when it ends in a known abbreviation;
-    // apply iteratively so chains collapse ("J. R. R. Tolkien" → one segment).
-    for (let i = 0; i < raw.length - 1; ) {
-      const words = text.slice(raw[i].start, raw[i].end).trim().split(/\s+/);
-      const lastWord = words[words.length - 1].toLowerCase();
-      if (ABBREVIATIONS.has(lastWord) || /^[a-z]\.$/.test(lastWord)) {
-        raw[i] = { start: raw[i].start, end: raw[i + 1].end };
-        raw.splice(i + 1, 1);
+  function endsWithMergeableAbbreviation(text, start, end) {
+    let cursor = end - 1;
+    while (cursor >= start && /\s/u.test(text[cursor])) cursor--;
+    const wordEnd = cursor + 1;
+    while (cursor >= start && !/\s/u.test(text[cursor])) cursor--;
+    const lastWord = text.slice(cursor + 1, wordEnd).toLowerCase();
+    return ABBREVIATIONS.has(lastWord) || /^[a-z]\.$/.test(lastWord);
+  }
+
+  // Intl.Segmenter gives ICU-quality boundaries for abbreviations, filenames,
+  // decimals, and mixed punctuation. Merge its known-abbreviation false splits
+  // in one forward pass so segmentation stays linear even for very large blocks.
+  function splitSentenceSpans(text) {
+    const merged = [];
+    let current = null;
+    for (const segment of sentenceSegmenter.segment(text)) {
+      const next = { start: segment.index, end: segment.index + segment.segment.length };
+      if (!current) {
+        current = next;
+      } else if (endsWithMergeableAbbreviation(text, current.start, current.end)) {
+        current.end = next.end;
       } else {
-        i++;
+        merged.push(current);
+        current = next;
       }
     }
+    if (current) merged.push(current);
 
-    const results = [];
-    for (const { start, end } of raw) {
+    const spans = [];
+    for (const { start, end } of merged) {
       // Drop pure-punctuation/whitespace segments (":)", stray marks) — TTS
       // engines either error or pronounce them literally ("colon close-paren").
       const trimmed = stripLeadingNoise(text.slice(start, end).trim());
-      if (!hasReadableContent(trimmed)) continue;
-      results.push({ text: trimmed, start, end });
+      if (hasReadableContent(trimmed)) spans.push({ text: trimmed, start, end });
     }
-    return results;
+    return spans;
   }
 
   function extractSentencesFromBlock(el) {
     const text = el.textContent;
     if (!text.trim()) return [];
-
-    const results = [];
-    for (const { text: sentText, start, end } of segmentSentences(text)) {
-      const range = charOffsetsToRange(el, start, end);
-      if (!range) continue;
-      const rects = range.getClientRects();
-      if (!rects.length) continue;
-      results.push({
-        text: sentText,
-        range,
-        startLineY: rects[0].top,
-        endLineY:   rects[rects.length - 1].top,
-      });
-    }
-
-    return results;
+    const spans = splitSentenceSpans(text);
+    const ranges = charOffsetSpansToRanges(el, spans);
+    return spans
+      .map((span, index) => ranges[index] ? { text: span.text, range: ranges[index] } : null)
+      .filter(Boolean);
   }
 
   // True when the string contains at least one letter or digit. Used to drop
@@ -644,31 +816,48 @@
     return text.replace(/^[^\p{L}\p{N}"'(\[«„“‘]+/u, '');
   }
 
-  function charOffsetsToRange(container, charStart, charEnd) {
+  // Convert all ordered character spans with one text-node walk. The previous
+  // helper restarted a TreeWalker for every sentence, making large blocks
+  // quadratic even after sentence splitting completed.
+  function charOffsetSpansToRanges(container, spans) {
     const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-    let pos = 0, startNode = null, startOff = 0, endNode = null, endOff = 0, node;
-
+    const nodes = [];
+    let pos = 0;
+    let node;
     while ((node = walker.nextNode())) {
       const len = node.textContent.length;
-      if (!startNode && pos + len > charStart) {
-        startNode = node;
-        startOff  = charStart - pos;
-      }
-      if (!endNode && pos + len >= charEnd) {
-        endNode = node;
-        endOff  = charEnd - pos;
-        break;
-      }
+      if (len) nodes.push({ node, start: pos, end: pos + len });
       pos += len;
     }
 
-    if (!startNode || !endNode) return null;
-    try {
-      const range = document.createRange();
-      range.setStart(startNode, startOff);
-      range.setEnd(endNode, endOff);
-      return range;
-    } catch { return null; }
+    const ranges = [];
+    let startNodeIndex = 0;
+    let endNodeIndex = 0;
+    for (const span of spans) {
+      while (startNodeIndex < nodes.length && nodes[startNodeIndex].end <= span.start) startNodeIndex++;
+      if (startNodeIndex >= nodes.length) {
+        ranges.push(null);
+        continue;
+      }
+      endNodeIndex = Math.max(endNodeIndex, startNodeIndex);
+      while (endNodeIndex < nodes.length && nodes[endNodeIndex].end < span.end) endNodeIndex++;
+      if (endNodeIndex >= nodes.length) {
+        ranges.push(null);
+        continue;
+      }
+
+      const startNode = nodes[startNodeIndex];
+      const endNode = nodes[endNodeIndex];
+      try {
+        const range = document.createRange();
+        range.setStart(startNode.node, span.start - startNode.start);
+        range.setEnd(endNode.node, span.end - endNode.start);
+        ranges.push(range);
+      } catch {
+        ranges.push(null);
+      }
+    }
+    return ranges;
   }
 
   // ── Floating player ────────────────────────────────────────────────
@@ -743,7 +932,6 @@
       }
       const voiceSelect = menuPanelEl.querySelector('.hltr-voice-select');
       ensureVoiceOption(voiceSelect, data.defaultVoice || cachedVoice, 'Configured voice');
-      loadVoiceOptions(voiceSelect, data.defaultVoice || cachedVoice);
 
       if (data.defaultVoice) {
         if (voiceSelect) voiceSelect.value = data.defaultVoice;
@@ -802,7 +990,11 @@
     });
 
     // Voice select
-    menuPanelEl.querySelector('.hltr-voice-select').addEventListener('change', (e) => {
+    const voiceSelect = menuPanelEl.querySelector('.hltr-voice-select');
+    const requestVoiceOptions = () => loadVoiceOptions(voiceSelect, voiceSelect.value || cachedVoice);
+    voiceSelect.addEventListener('focus', requestVoiceOptions);
+    voiceSelect.addEventListener('pointerdown', requestVoiceOptions);
+    voiceSelect.addEventListener('change', (e) => {
       const changed = e.target.value !== cachedVoice;
       if (changed) invalidateAudioCache('voice-changed');
       cachedVoice = e.target.value;
@@ -829,41 +1021,66 @@
   }
 
   // ── Player positioning & visibility ───────────────────────────────
+  function revealPlayer(playerPos = null) {
+    if (!playerEl) return;
+    const pw = playerEl.offsetWidth  || 200;
+    const ph = playerEl.offsetHeight || 54;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const margin = 12;
+
+    let left, top;
+    if (playerPos && Number.isFinite(playerPos.left) && Number.isFinite(playerPos.top)) {
+      // Clamp saved position in case viewport size changed.
+      left = Math.max(margin, Math.min(playerPos.left, vw - pw - margin));
+      top  = Math.max(margin, Math.min(playerPos.top,  vh - ph - margin));
+    } else {
+      // Default: top-right, same corner as the "Highlight Mode" badge.
+      left = vw - pw - margin;
+      top  = margin;
+    }
+
+    playerEl.style.left = left + 'px';
+    playerEl.style.top  = top  + 'px';
+    playerEl.classList.add('hltr-visible');
+    logDebug('player-shown', {
+      left,
+      top,
+      sentenceCount: pbSentences.length,
+    });
+  }
+
   function showPlayer() {
     if (!playerEl) return;
-    // Restore saved position, or default to top-right (near the indicator badge)
-    chrome.storage.local.get('playerPos', (data) => {
-      const storageError = chrome.runtime.lastError?.message || null;
-      if (storageError) {
-        logDebug('player-position-load-failed', { error: storageError });
-        data = {};
-      }
-      const pw = playerEl.offsetWidth  || 200;
-      const ph = playerEl.offsetHeight || 54;
-      const vw = window.innerWidth;
-      const vh = window.innerHeight;
-      const margin = 12;
+    const storageLocal = getExtensionStorageLocal();
+    if (!storageLocal) {
+      // Chrome invalidates extension APIs in already-injected scripts when an
+      // unpacked extension is reloaded. Keep the selection usable instead of
+      // throwing after the cursor stroke; a fresh shortcut/context-menu toggle
+      // will let the background inject a live replacement instance.
+      revealPlayer();
+      showPlayerWarning('Extension was reloaded — press Option-H again or refresh this page to reconnect');
+      return;
+    }
 
-      let left, top;
-      if (data.playerPos) {
-        // Clamp saved position in case viewport size changed
-        left = Math.max(margin, Math.min(data.playerPos.left, vw - pw - margin));
-        top  = Math.max(margin, Math.min(data.playerPos.top,  vh - ph - margin));
-      } else {
-        // Default: top-right, same corner as the "Highlight Mode" badge
-        left = vw - pw - margin;
-        top  = margin;
-      }
-
-      playerEl.style.left = left + 'px';
-      playerEl.style.top  = top  + 'px';
-      playerEl.classList.add('hltr-visible');
-      logDebug('player-shown', {
-        left,
-        top,
-        sentenceCount: pbSentences.length,
+    try {
+      // Restore saved position, or default to top-right (near the indicator badge).
+      storageLocal.get('playerPos', (data) => {
+        if (!isCurrentContentInstance()) return;
+        let storageError = null;
+        try {
+          storageError = chrome.runtime?.lastError?.message || null;
+        } catch {
+          storageError = 'Extension context invalidated';
+        }
+        if (storageError) logDebug('player-position-load-failed', { error: storageError });
+        revealPlayer(storageError ? null : data?.playerPos);
       });
-    });
+    } catch (error) {
+      logDebug('player-position-load-failed', { error: error?.message || String(error) });
+      revealPlayer();
+      showPlayerWarning('Extension was reloaded — press Option-H again or refresh this page to reconnect');
+    }
   }
 
   function hidePlayer() {
@@ -1015,16 +1232,19 @@
     // Re-insert to mark as most-recently-used.
     audioCache.delete(idx);
     audioCache.set(idx, entry);
-    return entry.audioDataUrl;
+    return entry.audioBlob;
   }
 
   function setCachedAudio(idx, voice, speed, audioDataUrl) {
-    if (!audioDataUrl) return;
-    audioCache.set(idx, { audioDataUrl, voice, speed });
+    const audioBlob = audioDataUrl instanceof Blob ? audioDataUrl : audioDataUrlToBlob(audioDataUrl);
+    if (!audioBlob) return null;
+    audioCache.delete(idx);
+    audioCache.set(idx, { audioBlob, voice, speed });
     while (audioCache.size > AUDIO_CACHE_LIMIT) {
       const oldestKey = audioCache.keys().next().value;
       audioCache.delete(oldestKey);
     }
+    return audioBlob;
   }
 
   function invalidateAudioCache(reason) {
@@ -1082,6 +1302,7 @@
 
   function prefetchSentence(idx, voice, speed) {
     if (idx < 0 || idx >= pbSentences.length) return;
+    if (!hasLiveExtensionRuntime()) return;
     // A4: policy engaged — don't queue engine work the session won't use.
     if (sessionFallbackCount >= 2) return;
     if (audioCache.has(idx)) return;
@@ -1109,7 +1330,7 @@
         inflightTtsIds.delete(clientRequestId);
         pendingPrefetch.delete(idx);
         // Hand our result to a playSentence that joined this prefetch, if any.
-        // Resolve exactly once: null on any failure/cancel/stale, the audio url
+        // Resolve exactly once: null on any failure/cancel/stale, the audio Blob
         // on success. A superseded joiner is filtered by its own requestId guard.
         const waiter = entry.waiter;
         entry.waiter = null;
@@ -1136,9 +1357,14 @@
           if (waiter) waiter(null);
           return;
         }
-        setCachedAudio(idx, voice, speed, response.audioDataUrl);
-        logDebug('prefetch-cached', { idx, elapsedMs, audioBase64Length: response.audioDataUrl.length });
-        if (waiter) waiter(response.audioDataUrl);
+        const audioBlob = setCachedAudio(idx, voice, speed, response.audioDataUrl);
+        if (!audioBlob) {
+          logDebug('prefetch-failed', { idx, elapsedMs, error: 'invalid-audio-data' });
+          if (waiter) waiter(null);
+          return;
+        }
+        logDebug('prefetch-cached', { idx, elapsedMs, audioBytes: audioBlob.size });
+        if (waiter) waiter(audioBlob);
         // Continuous refill — only reachable in the non-stale, non-cancelled
         // success branch (the guard above returns otherwise), so a dead session
         // can't re-prime the pipeline. Uses this prefetch's voice/speed, which
@@ -1312,11 +1538,11 @@
     // Cache hit → skip the network roundtrip entirely. Cached audio is real
     // Kokoro output that was already synthesized, so we play it even when the
     // session fallback policy is engaged (it's free and correct).
-    const cachedUrl = getCachedAudio(idx, voice, speed);
-    if (cachedUrl) {
+    const cachedAudio = getCachedAudio(idx, voice, speed);
+    if (cachedAudio) {
       logDebug('tts-cache-hit', { idx, voice, speed });
       cancelledRetryCount = 0; // a real (cached) Kokoro response is playing
-      playAudioDataUrl(cachedUrl, requestId, speed, text);
+      playAudioSource(cachedAudio, requestId, speed, text);
       maybePrefetchAhead(idx, voice, speed);
       return;
     }
@@ -1330,6 +1556,16 @@
         showPlayerWarning('Using system voice for the rest of this reading');
       }
       logDebug('session-fallback-engaged', { idx, sessionFallbackCount });
+      fallbackSpeechSynthesis(text, speed, requestId);
+      return;
+    }
+
+    if (!hasLiveExtensionRuntime()) {
+      // The page can retain a working cursor after an unpacked-extension
+      // reload even though its Chrome messaging context is gone. Do not leave
+      // Play stuck or throw; explain the recovery and use the system voice.
+      logDebug('extension-context-invalidated', { idx });
+      showPlayerWarning('Extension was reloaded — using system voice until you press Option-H again or refresh');
       fallbackSpeechSynthesis(text, speed, requestId);
       return;
     }
@@ -1393,20 +1629,20 @@
       logDebug('tts-join-prefetch', { idx, voice, speed });
       // Overwriting any prior waiter is safe: it belonged to a superseded
       // playSentence whose requestId guard will discard its resolution.
-      pending.waiter = (audioDataUrl) => {
+      pending.waiter = (audioBlob) => {
         // Whichever fires first — this resolution or the shared timeout — wins;
         // clear the timeout so a delivered join doesn't later trip the fallback.
         clearTimeout(responseTimeout);
         // Superseded (skip / new stroke / menu change bumped pbRequestId) — the
         // newer request owns playback; discard exactly like the sendMessage guard.
         if (requestId !== pbRequestId) return;
-        if (audioDataUrl) {
+        if (audioBlob) {
           // The prefetch delivered real Kokoro audio — engine healthy, and it
           // already ran setCachedAudio, so just play and prefetch ahead.
           sessionFallbackCount = 0;
           sessionFallbackToastShown = false;
           cancelledRetryCount = 0;
-          playAudioDataUrl(audioDataUrl, requestId, speed, text);
+          playAudioSource(audioBlob, requestId, speed, text);
           maybePrefetchAhead(idx, voice, speed);
         } else if (pending.token.cancelled) {
           // Teardown nulled the prefetch (a voice/speed change re-issues on its
@@ -1500,8 +1736,8 @@
         cancelledRetryCount = 0; // engine delivered — reset the I2 retry budget
 
         // Stash for skip-back / replay; no extra round-trip if we revisit.
-        setCachedAudio(idx, voice, speed, response.audioDataUrl);
-        playAudioDataUrl(response.audioDataUrl, requestId, speed, text);
+        const audioSource = setCachedAudio(idx, voice, speed, response.audioDataUrl) || response.audioDataUrl;
+        playAudioSource(audioSource, requestId, speed, text);
         maybePrefetchAhead(idx, voice, speed);
       }
     );
@@ -1531,10 +1767,23 @@
     }
   }
 
-  function playAudioDataUrl(dataUrl, requestId, speed, text) {
+  function playAudioSource(audioSource, requestId, speed, text) {
     // FIX 1: Capture requestId in closure so the ended handler can check staleness
     const capturedId = requestId;
-    const audioUrl = audioDataUrlToObjectUrl(dataUrl) || dataUrl;
+    const audioBlob = audioSource instanceof Blob ? audioSource : audioDataUrlToBlob(audioSource);
+    let audioUrl = typeof audioSource === 'string' ? audioSource : '';
+    if (audioBlob) {
+      try {
+        audioUrl = URL.createObjectURL(audioBlob);
+      } catch (err) {
+        logDebug('audio-blob-url-failed', { message: err?.message || String(err) });
+      }
+    }
+    if (!audioUrl) {
+      logDebug('audio-source-unavailable', { requestId: capturedId });
+      fallbackSpeechSynthesis(text, speed, capturedId);
+      return;
+    }
     pbAudioObjectUrl = audioUrl.startsWith('blob:') ? audioUrl : null;
     pbAudio = new Audio(audioUrl);
     // Speed is applied by Kokoro during synthesis; double-applying
@@ -1639,7 +1888,7 @@
       });
   }
 
-  function audioDataUrlToObjectUrl(dataUrl) {
+  function audioDataUrlToBlob(dataUrl) {
     const match = /^data:([^;,]+);base64,(.*)$/s.exec(dataUrl || '');
     if (!match) return null;
 
@@ -1654,9 +1903,9 @@
         for (let j = 0; j < slice.length; j++) bytes[j] = slice.charCodeAt(j);
         chunks.push(bytes);
       }
-      return URL.createObjectURL(new Blob(chunks, { type: mimeType }));
+      return new Blob(chunks, { type: mimeType });
     } catch (err) {
-      logDebug('audio-blob-url-failed', { message: err?.message || String(err) });
+      logDebug('audio-data-decode-failed', { message: err?.message || String(err) });
       return null;
     }
   }
@@ -1810,10 +2059,12 @@
   }
 
   function loadVoiceOptions(selectEl, selectedVoice) {
-    if (!selectEl) return;
+    if (!selectEl || selectEl.dataset.voicesLoaded === 'true' || selectEl.dataset.voicesLoading === 'true') return;
+    selectEl.dataset.voicesLoading = 'true';
     const startedAt = performance.now();
     logDebug('voices-request-start', { selectedVoice });
     chrome.runtime.sendMessage({ type: 'voices-request' }, (response) => {
+      delete selectEl.dataset.voicesLoading;
       logDebug('voices-response', {
         ok: Boolean(response?.ok),
         error: response?.error || null,
@@ -1848,6 +2099,7 @@
       }
 
       selectEl.replaceChildren(fragment);
+      selectEl.dataset.voicesLoaded = 'true';
       selectEl.value = selectedVoice || cachedVoice;
       if (!selectEl.value) ensureVoiceOption(selectEl, selectedVoice || cachedVoice, 'Configured voice');
     });
@@ -1998,18 +2250,19 @@
 
   // ── Mouse handling ─────────────────────────────────────────────────
   function onMouseMove(e) {
+    if (!isCurrentContentInstance()) return;
     if (!highlightMode) return;
     if (cursorEl) {
       cursorEl.style.left = e.clientX + 'px';
       cursorEl.style.top  = e.clientY + 'px';
     }
     if (isPainting) {
-      strokePoints.push({ x: e.clientX, y: e.clientY });
-      renderStroke();
+      appendStrokePoint({ x: e.clientX, y: e.clientY });
     }
   }
 
   function onMouseDown(e) {
+    if (!isCurrentContentInstance()) return;
     if (!highlightMode) return;
     if (e.button !== 0) return;
     // Don't start a stroke if clicking the player or settings menu
@@ -2019,15 +2272,21 @@
     e.stopPropagation();
     isPainting   = true;
     strokePoints = [{ x: e.clientX, y: e.clientY }];
-    renderStroke();
+    flushStrokeRender();
   }
 
   function onMouseUp(e) {
+    if (!isCurrentContentInstance()) return;
     if (!highlightMode) return;
     if (!isPainting) return;
     e.preventDefault();
     e.stopPropagation();
     isPainting = false;
+
+    // mousemove can be coalesced; record the actual release coordinate so
+    // selection geometry always uses the full stroke.
+    appendStrokePoint({ x: e.clientX, y: e.clientY }, true);
+    flushStrokeRender();
 
     // FIX 6: Guard against empty strokePoints before accessing indices
     if (!strokePoints.length) return;
@@ -2044,6 +2303,7 @@
   }
 
   function onClickCapture(e) {
+    if (!isCurrentContentInstance()) return;
     // The click that immediately follows a stroke mouseup should be swallowed —
     // it would otherwise dismiss the player we just showed.
     if (suppressNextClick) {
@@ -2066,6 +2326,7 @@
 
   // ── Keyboard handling ──────────────────────────────────────────────
   function onKeyDown(e) {
+    if (!isCurrentContentInstance()) return;
     if (e.key === 'Escape') {
       if (highlightMode) exitHighlightMode();
     }
@@ -2080,6 +2341,7 @@
 
   // ── Message listener ───────────────────────────────────────────────
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+    if (!isCurrentContentInstance()) return;
     if (msg.action === 'toggleHighlightMode') {
       toggleHighlightMode();
       sendResponse({ ok: true, highlightMode });

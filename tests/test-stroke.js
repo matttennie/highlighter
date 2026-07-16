@@ -3,7 +3,12 @@
  * extracted from content.js.
  */
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { describe, it } from 'node:test';
+
+const rootDir = path.resolve(import.meta.dirname, '..');
+const contentJs = fs.readFileSync(path.join(rootDir, 'content', 'content.js'), 'utf8');
 
 // Extracted from content.js buildPathData
 function buildPathData(points) {
@@ -49,6 +54,32 @@ describe('buildPathData', () => {
   it('handles negative coordinates', () => {
     const d = buildPathData([{ x: -10, y: -20 }, { x: 10, y: 20 }]);
     assert.equal(d, 'M-10,-20L10,20');
+  });
+});
+
+describe('bounded stroke rendering', () => {
+  it('coalesces SVG writes through requestAnimationFrame', () => {
+    assert.match(contentJs, /function scheduleStrokeRender\(\)/);
+    assert.match(contentJs, /strokeRenderFrame = requestAnimationFrame/);
+    const onMove = contentJs.match(/function onMouseMove\(e\) \{([\s\S]*?)\n {2}\}/);
+    assert.ok(onMove, 'onMouseMove not found');
+    assert.match(onMove[1], /appendStrokePoint/);
+    assert.doesNotMatch(onMove[1], /renderStroke\(\)/);
+  });
+
+  it('decimates pointer jitter and bounds retained SVG points', () => {
+    assert.match(contentJs, /const STROKE_POINT_MIN_DISTANCE_SQ = 4/);
+    assert.match(contentJs, /const MAX_STROKE_POINTS = 1024/);
+    assert.match(contentJs, /function compactStrokePoints\(\)/);
+    assert.match(contentJs, /strokePoints\.length <= MAX_STROKE_POINTS/);
+  });
+
+  it('records the release coordinate before resolving the selection', () => {
+    const onUp = contentJs.match(/function onMouseUp\(e\) \{([\s\S]*?)\n {2}\}/);
+    assert.ok(onUp, 'onMouseUp not found');
+    const appendAt = onUp[1].indexOf('appendStrokePoint({ x: e.clientX, y: e.clientY }, true)');
+    const resolveAt = onUp[1].indexOf('resolveAndSelect(startPt, endPt)');
+    assert.ok(appendAt !== -1 && resolveAt > appendAt);
   });
 });
 

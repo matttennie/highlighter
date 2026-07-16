@@ -297,6 +297,34 @@ describe('arrayBufferToBase64', () => {
   });
 });
 
+describe('content.js decoded-audio cache contracts', () => {
+  const contentJs = fs.readFileSync(path.join(rootDir, 'content', 'content.js'), 'utf8');
+
+  it('stores binary Blobs instead of retaining base64 data URLs', () => {
+    const setCache = contentJs.match(/function setCachedAudio\(idx, voice, speed, audioDataUrl\) \{([\s\S]*?)\n {2}\}/);
+    assert.ok(setCache, 'setCachedAudio not found');
+    assert.match(setCache[1], /audioDataUrlToBlob\(audioDataUrl\)/);
+    assert.match(setCache[1], /\{ audioBlob, voice, speed \}/);
+    assert.match(contentJs, /return entry\.audioBlob/);
+    assert.doesNotMatch(contentJs, /\{ audioDataUrl, voice, speed \}/);
+  });
+
+  it('decodes each successful response before caching and reuses that Blob for playback', () => {
+    assert.match(contentJs, /const audioSource = setCachedAudio\([\s\S]*?playAudioSource\(audioSource/);
+    assert.match(contentJs, /pending\.waiter = \(audioBlob\) =>/);
+    assert.match(contentJs, /if \(waiter\) waiter\(audioBlob\)/);
+    assert.match(contentJs, /playAudioSource\(cachedAudio/);
+  });
+
+  it('creates short-lived object URLs for playback and revokes them on release', () => {
+    const play = contentJs.match(/function playAudioSource\(audioSource, requestId, speed, text\) \{([\s\S]*?)\n {2}function audioDataUrlToBlob/);
+    assert.ok(play, 'playAudioSource not found');
+    assert.match(play[1], /audioSource instanceof Blob/);
+    assert.match(play[1], /URL\.createObjectURL\(audioBlob\)/);
+    assert.match(contentJs, /URL\.revokeObjectURL\(pbAudioObjectUrl\)/);
+  });
+});
+
 // ── splitLongSentenceText (mirrors content.js) ───────────────────────
 
 // Mirror of content.js#splitLongSentenceText — keep byte-identical.
@@ -490,7 +518,7 @@ describe('content.js prefetch pipeline contracts', () => {
     assert.ok(fn, 'prefetchSentence not found');
     const body = fn[1];
     const cacheAt = body.indexOf('setCachedAudio(idx, voice, speed, response.audioDataUrl)');
-    const waiterAt = body.indexOf('if (waiter) waiter(response.audioDataUrl)');
+    const waiterAt = body.indexOf('if (waiter) waiter(audioBlob)');
     const topUpAt = body.indexOf('topUpPrefetch(voice, speed)');
     assert.ok(cacheAt !== -1 && waiterAt !== -1 && topUpAt !== -1, 'success-path cache/waiter/topUp all present');
     assert.ok(cacheAt < waiterAt && waiterAt < topUpAt, 'topUp must run after setCachedAudio and waiter resolution');
@@ -511,7 +539,7 @@ describe('content.js prefetch pipeline contracts', () => {
     assert.ok(playSentenceBody, 'playSentence body not found');
     const body = playSentenceBody[1];
     // Join branch: eager kick before its return, after registering the waiter.
-    const joinAt = body.indexOf('pending.waiter = (audioDataUrl) =>');
+    const joinAt = body.indexOf('pending.waiter = (audioBlob) =>');
     // Fresh send: the direct tts-request path.
     const freshSendAt = body.indexOf('inflightTtsIds.add(clientRequestId)');
     // Eager kicks: the cache-hit path already had one; count the request-path ones.
@@ -708,7 +736,7 @@ describe('content.js join-in-flight-prefetch contracts', () => {
   it('registers a single waiter that clears the shared timeout and honours the staleness guard', () => {
     assert.ok(playSentenceBody, 'playSentence body not found');
     const body = playSentenceBody[1];
-    assert.match(body, /pending\.waiter = \(audioDataUrl\) =>/, 'playSentence must register a waiter on the pending prefetch');
+    assert.match(body, /pending\.waiter = \(audioBlob\) =>/, 'playSentence must register a waiter on the pending prefetch');
     assert.match(
       body,
       /clearTimeout\(responseTimeout\)[\s\S]*?if \(requestId !== pbRequestId\) return/,
@@ -725,11 +753,11 @@ describe('content.js join-in-flight-prefetch contracts', () => {
     assert.match(contentJs, /pendingPrefetch\.set\(idx, entry\)/);
   });
 
-  it('prefetch resolves its waiter with the audio url on success and null on every failure path', () => {
+  it('prefetch resolves its waiter with the decoded audio blob on success and null on every failure path', () => {
     assert.match(
       contentJs,
-      /if \(waiter\) waiter\(response\.audioDataUrl\)/,
-      'a successful prefetch must resolve the waiter with the synthesized audio url',
+      /if \(waiter\) waiter\(audioBlob\)/,
+      'a successful prefetch must resolve the waiter with the decoded audio blob',
     );
     const nullResolves = contentJs.match(/if \(waiter\) waiter\(null\)/g) || [];
     // prefetch callback: discarded/stale + cancelled + failed, plus cancelAllPrefetches teardown.
@@ -817,13 +845,13 @@ describe('content.js inter-sentence pacing contracts', () => {
     );
   });
 
-  it('stamps every sentence with blockIdx in collectSentences using a per-block counter', () => {
+  it('stamps cached sentence structure with blockIdx using a per-block counter', () => {
     const fn = contentJs.match(
-      /function collectSentences\(\)\s*\{([\s\S]*?)\n {2}\}/,
+      /function buildSentenceStructure\(root\)\s*\{([\s\S]*?)\n {2}\}/,
     );
-    assert.ok(fn, 'collectSentences not found');
-    assert.match(fn[1], /let blockIdx\s*=\s*0;/, 'collectSentences must maintain a per-block counter');
-    assert.match(fn[1], /s\.blockIdx = blockIdx/, 'every pushed sentence must be stamped with blockIdx');
+    assert.ok(fn, 'buildSentenceStructure not found');
+    assert.match(fn[1], /let blockIdx\s*=\s*0;/, 'buildSentenceStructure must maintain a per-block counter');
+    assert.match(fn[1], /entries\.push\(\{ \.\.\.sentence, block, blockIdx \}\)/, 'every cached sentence must be stamped with blockIdx');
     assert.match(fn[1], /blockIdx\+\+/, 'the counter must advance per block whose sentences get extracted');
   });
 

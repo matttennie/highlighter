@@ -16,7 +16,8 @@ const ENGINE_POLL_MS = 1000;
 
 let statusTimer = 0;
 let enginePollTimer = 0;
-let voicesLoadedFromEngine = false;
+let voiceCatalogLoaded = false;
+let voicesLoading = false;
 
 function logDebug(event, details = {}) {
   console.log(`${LOG_PREFIX} ${event}`, details);
@@ -61,6 +62,12 @@ function renderSpeed(speed) {
 }
 
 // ── Load saved settings ─────────────────────────────────────────────
+// Do this independently of storage: selecting Highlighter in the toolbar must
+// start/attach the native companion even if settings storage is unavailable.
+// retryNative is sent only for this initial popup engagement; status polls do
+// not bypass the background worker's failed-host backoff.
+refreshEngineStatus({ wake: true, nativeOnly: true, retryNative: true });
+
 chrome.storage.local.get(['defaultVoice', 'defaultSpeed', 'articleMode'], (data) => {
   const storageError = chrome.runtime.lastError?.message || null;
   if (storageError) {
@@ -80,8 +87,6 @@ chrome.storage.local.get(['defaultVoice', 'defaultSpeed', 'articleMode'], (data)
   if (data.articleMode !== undefined) articleToggle.checked = data.articleMode;
 
   ensureVoiceOption(effectiveVoice, 'Saved voice');
-  refreshEngineStatus();
-  loadVoices(effectiveVoice);
 });
 
 function showStatus(msg) {
@@ -125,9 +130,12 @@ function setDefaultVoice(voiceId) {
 }
 
 function loadVoices(selectedVoice) {
+  if (voiceCatalogLoaded || voicesLoading) return;
+  voicesLoading = true;
   const startedAt = performance.now();
   logDebug('voices-request-start', { selectedVoice });
   chrome.runtime.sendMessage({ type: 'voices-request' }, (response) => {
+    voicesLoading = false;
     logDebug('voices-response', {
       ok: Boolean(response?.ok),
       error: response?.error || null,
@@ -136,8 +144,8 @@ function loadVoices(selectedVoice) {
       runtimeError: chrome.runtime.lastError?.message || null,
     });
     if (chrome.runtime.lastError || !response || !response.ok || !response.voices?.length) {
-      // Model probably still downloading — the engine-status poll retries
-      // loadVoices once the engine reports ready.
+      // Keep the configured value usable; the next selector interaction can
+      // retry the lightweight static catalog request.
       ensureVoiceOption(selectedVoice || DEFAULT_VOICE_ID, 'Default voice');
       return;
     }
@@ -163,7 +171,7 @@ function loadVoices(selectedVoice) {
     }
 
     voiceSelect.replaceChildren(fragment);
-    voicesLoadedFromEngine = true;
+    voiceCatalogLoaded = true;
     const effectiveVoiceId = Array.from(voiceSelect.options).some((option) => option.value === selectedVoice)
       ? selectedVoice
       : DEFAULT_VOICE_ID;
@@ -178,48 +186,66 @@ function loadVoices(selectedVoice) {
   });
 }
 
-// ── Engine status ───────────────────────────────────────────────────
-function scheduleEnginePoll() {
-  clearTimeout(enginePollTimer);
-  enginePollTimer = setTimeout(refreshEngineStatus, ENGINE_POLL_MS);
+function requestVoiceCatalog() {
+  loadVoices(voiceSelect.value || DEFAULT_VOICE_ID);
 }
 
-function refreshEngineStatus() {
-  chrome.runtime.sendMessage({ type: 'engine-status-request' }, (resp) => {
-    const runtimeError = chrome.runtime.lastError?.message || null;
-    if (runtimeError || !resp || !resp.ok) {
-      engineStatusEl.textContent = 'Engine unavailable — system voice will be used';
-      logDebug('engine-status-failed', { error: runtimeError || resp?.error || 'no-response' });
-      return;
+// ── Engine status ───────────────────────────────────────────────────
+function scheduleEnginePoll({ nativeOnly = false } = {}) {
+  clearTimeout(enginePollTimer);
+  enginePollTimer = setTimeout(
+    () => refreshEngineStatus({ wake: true, nativeOnly }),
+    ENGINE_POLL_MS
+  );
+}
+
+function refreshEngineStatus({ wake = false, nativeOnly = false, retryNative = false } = {}) {
+  chrome.runtime.sendMessage(
+    { type: 'engine-status-request', wake, nativeOnly, retryNative },
+    (resp) => {
+      const runtimeError = chrome.runtime.lastError?.message || null;
+      if (runtimeError || !resp || !resp.ok) {
+        engineStatusEl.textContent = 'Engine unavailable — system voice will be used';
+        logDebug('engine-status-failed', { error: runtimeError || resp?.error || 'no-response' });
+        return;
+      }
+      switch (resp.status) {
+        case 'downloading':
+          // Warm weights come from disk cache — that's a wake-up, not a download.
+          engineStatusEl.textContent = resp.warm
+            ? `Waking up voice engine — ${resp.progress || 0}%`
+            : `Downloading voice model — ${resp.progress || 0}%`;
+          scheduleEnginePoll({ nativeOnly });
+          break;
+        case 'starting':
+          engineStatusEl.textContent = 'Starting native Kokoro server…';
+          scheduleEnginePoll({ nativeOnly: true });
+          break;
+        case 'ready':
+          if (resp.backend === 'native') {
+            engineStatusEl.textContent = 'Ready — native Kokoro server';
+          } else {
+            // Device is always CPU now. Surface the WASM thread count — single-thread
+            // (no cross-origin isolation, hence no SharedArrayBuffer) is much slower.
+            engineStatusEl.textContent = resp.isolated === false
+              ? 'Ready — on-device (CPU, single-thread — slow)'
+              : `Ready — on-device (CPU, ${resp.threads || '?'} threads)`;
+          }
+          break;
+        case 'error':
+          engineStatusEl.textContent = `Engine error: ${resp.error || 'unknown'}`;
+          break;
+        case 'unavailable':
+          engineStatusEl.textContent = 'Native server unavailable — built-in engine starts on Play';
+          break;
+        default: // 'idle' — engine starts loading on first request
+          engineStatusEl.textContent = wake
+            ? 'Starting voice engine…'
+            : 'Voice engine starts when you play text or test a voice';
+          if (wake) scheduleEnginePoll({ nativeOnly });
+      }
     }
-    switch (resp.status) {
-      case 'downloading':
-        // Warm weights come from disk cache — that's a wake-up, not a download.
-        engineStatusEl.textContent = resp.warm
-          ? `Waking up voice engine — ${resp.progress || 0}%`
-          : `Downloading voice model — ${resp.progress || 0}%`;
-        scheduleEnginePoll();
-        break;
-      case 'ready':
-        if (resp.backend === 'native') {
-          engineStatusEl.textContent = 'Ready — native Kokoro server';
-        } else {
-          // Device is always CPU now. Surface the WASM thread count — single-thread
-          // (no cross-origin isolation, hence no SharedArrayBuffer) is much slower.
-          engineStatusEl.textContent = resp.isolated === false
-            ? 'Ready — on-device (CPU, single-thread — slow)'
-            : `Ready — on-device (CPU, ${resp.threads || '?'} threads)`;
-        }
-        if (!voicesLoadedFromEngine) loadVoices(voiceSelect.value || DEFAULT_VOICE_ID);
-        break;
-      case 'error':
-        engineStatusEl.textContent = `Engine error: ${resp.error || 'unknown'}`;
-        break;
-      default: // 'idle' — engine starts loading on first request
-        engineStatusEl.textContent = 'Starting voice engine…';
-        scheduleEnginePoll();
-    }
-  });
+  );
 }
 
 // ── Debug log actions ───────────────────────────────────────────────
@@ -291,7 +317,7 @@ function testVoice() {
           : (resp?.detail || resp?.error || runtimeError || 'no response');
         showInPreview([`Test failed: ${reason}`]);
         showStatus('Test failed');
-        refreshEngineStatus();
+        refreshEngineStatus({ wake: true });
         return;
       }
       showInPreview([
@@ -302,6 +328,7 @@ function testVoice() {
       new Audio(resp.audioDataUrl).play().catch((err) => {
         showStatus(`Playback failed: ${err?.message || err}`);
       });
+      refreshEngineStatus();
       showStatus('Playing test voice');
     }
   );
@@ -309,6 +336,8 @@ function testVoice() {
 
 // ── Event wiring ────────────────────────────────────────────────────
 voiceSelect.addEventListener('change', () => save('defaultVoice', voiceSelect.value));
+voiceSelect.addEventListener('focus', requestVoiceCatalog);
+voiceSelect.addEventListener('pointerdown', requestVoiceCatalog);
 speedSlider.addEventListener('input', () => {
   speedValueEl.textContent = formatSpeedLabel(snapSpeed(speedSlider.value));
 });

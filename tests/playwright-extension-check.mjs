@@ -12,9 +12,29 @@ const server = await startTestServer();
 const extension = await launchExtension({ startedAt });
 
 try {
+  await extension.popupPage.waitForFunction(() => {
+    const status = document.querySelector('#engineStatus')?.textContent || '';
+    return /native Kokoro|Native server/.test(status);
+  }, { timeout: 30000 });
+  const initialEngineStatus = await extension.popupPage.locator('#engineStatus').textContent();
+  const initialVoiceOptionCount = await extension.popupPage.locator('#defaultVoice option').count();
+  if (initialVoiceOptionCount !== 1) {
+    throw new Error(`popup eagerly loaded voices: option count ${initialVoiceOptionCount}`);
+  }
+  const initialOffscreenContextCount = await extension.serviceWorker.evaluate(async () => {
+    const contexts = await chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] });
+    return contexts.length;
+  });
+  if (initialOffscreenContextCount !== 0) {
+    throw new Error(`popup eagerly created ${initialOffscreenContextCount} offscreen engine context(s)`);
+  }
+
+  // Opening the popup must wake the native companion but leave the heavy WASM
+  // fallback and static voice catalog untouched.
+  await extension.popupPage.locator('#defaultVoice').focus();
   await extension.popupPage.waitForFunction(
     () => document.querySelectorAll('#defaultVoice option').length > 1,
-    { timeout: 10000 }
+    { timeout: 30000 }
   );
 
   const voiceOptions = await extension.popupPage.locator('#defaultVoice option').evaluateAll((options) =>
@@ -101,6 +121,9 @@ try {
         testPageUrl: server.url,
         toggleResponse,
         debugLoopProbe,
+        initialEngineStatus,
+        initialVoiceOptionCount,
+        initialOffscreenContextCount,
         voiceOptions,
         voicesResponse,
         ttsResponse: {
