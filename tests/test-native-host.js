@@ -106,6 +106,9 @@ describe('server/native_host.py', () => {
   it('starts the shared server outside Chrome via launchd and tracks its warmth claim', () => {
     assert.match(host, /SHARED_TTS_DIR/);
     assert.match(host, /launchctl", "submit"/);
+    // submit alone can park forever ("pending spawn, domain in on-demand-only
+    // mode" — seen on macOS 26.3); kickstart is an explicit demand that spawns.
+    assert.match(host, /launchctl", "kickstart"/);
     assert.match(host, /write_marker\(\)/);
     assert.match(host, /remove_marker\(\)/);
     assert.match(host, /def _watch_port\(\)/);

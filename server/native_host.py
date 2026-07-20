@@ -185,6 +185,14 @@ def _spawn_shared_via_launchd(cmd):
              "-o", "/dev/null", "-e", ERR_LOG,
              "--", "/usr/bin/env"] + env_prefix + cmd,
             stdout=errlog, stderr=errlog)
+        # submit alone can park the job forever ("pending spawn, domain in
+        # on-demand-only mode" — seen on macOS 26.3, where the gui domain
+        # stops auto-spawning legacy submits). kickstart is an explicit
+        # demand: it spawns a parked job and is a no-op on a running one.
+        subprocess.run(
+            ["launchctl", "kickstart",
+             "gui/%d/%s" % (os.getuid(), SHARED_JOB_LABEL)],
+            stdout=errlog, stderr=errlog)
 
 
 def reap(child):
